@@ -14,7 +14,7 @@ development = ["trillium-testing"]
 
 [dependencies]
 log = "0.4.29"
-askama = "0.16.0"
+askama = "0.16.1"
 trillium.workspace = true
 
 [dev-dependencies]
