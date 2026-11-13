@@ -6,7 +6,7 @@ publish = false
 description = "External-spec conformance runner for trillium. Runs h2spec (and eventually other conformance suites) against a live trillium server across the runtime × TLS matrix."
 
 [dependencies]
-anyhow = "1.0"
+anyhow = "1.0.104"
 clap = { version = "4.5", features = ["derive"] }
 env_logger = "0.11.10"
 junit-parser = "1.5"
