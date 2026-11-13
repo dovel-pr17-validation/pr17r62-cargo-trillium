@@ -1,0 +1,32 @@
+use test_harness::test;
+use trillium::Conn;
+use trillium_testing::{TestServer, harness};
+
+#[test(harness)]
+async fn body_does_not_report_closure() {
+    let handler = |mut conn: Conn| async move {
+        let body = conn.request_body().read_string().await.unwrap();
+
+        if conn.is_disconnected().await {
+            return conn.with_status(500);
+        }
+
+        if conn
+            .cancel_on_disconnect(futures_lite::future::yield_now())
+            .await
+            .is_none()
+        {
+            return conn.with_status(501);
+        }
+
+        conn.ok("ok").with_body(body)
+    };
+
+    let app = TestServer::new(handler).await;
+
+    app.post("/")
+        .with_body("body")
+        .await
+        .assert_ok()
+        .assert_body("body");
+}

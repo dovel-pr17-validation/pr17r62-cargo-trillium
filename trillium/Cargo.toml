@@ -1,0 +1,41 @@
+[package]
+name = "trillium"
+version = "1.4.1"
+edition = "2024"
+description = "a modular toolkit for building async web apps"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/trillium-rs/trillium"
+readme = "README.md"
+keywords = ["trillium", "framework", "async"]
+categories = ["web-programming::http-server", "web-programming"]
+
+[package.metadata.cargo-udeps.ignore]
+development = ["trillium-testing"]
+
+[features]
+unstable = ["trillium-http/unstable"]
+http-compat-0 = ["trillium-http/http-compat-0"]
+http-compat-1 = ["trillium-http/http-compat-1"]
+serde = ["trillium-http/serde"]
+
+# Vestigial: the trillium-http http/1.x parser is now always selected. This feature is retained as a
+# no-op for semver compatibility
+parse = []
+
+[dependencies]
+futures-lite = "2.6.1"
+log = "0.4.29"
+trillium-http.workspace = true
+trillium-macros.workspace = true
+
+[dev-dependencies]
+futures-lite = "2.6.1"
+async-channel = "2.5.0"
+async-io = "2.6.0"
+fastrand = "2.3.0"
+trillium-smol = { path = "../smol" }
+trillium-testing = { path = "../testing" }
+env_logger = "0.11.10"
+trillium-client = { path = "../client" }
+test-harness = "0.3.1"
+

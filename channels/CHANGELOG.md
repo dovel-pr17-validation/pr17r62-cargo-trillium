@@ -1,0 +1,35 @@
+# Changelog
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.4.0] - 2026-05-02
+
+### Changed
+- Compatible with trillium 1.0
+- `ChannelHandler` no longer uses `#[async_trait]`; remove the attribute from any implementations in your code
+
+### Added
+- deprecate set_state for insert_state
+
+### Other
+- release
+- release
+- release
+- *(deps)* update async-broadcast requirement from 0.6.0 to 0.7.0
+- Release only rustls
+- release
+- release
+
+## [0.3.1](https://github.com/trillium-rs/trillium/compare/trillium-channels-v0.3.0...trillium-channels-v0.3.1) - 2024-01-02
+
+### Other
+- update dependencies other than trillium-rustls
+- (cargo-release) version 0.6.0
+- deps
+- upgrade deps
+- remove dependency carats
+- Update futures-lite requirement from 1.13.0 to 2.0.0
+- Update async-broadcast requirement from 0.5.1 to 0.6.0
+- deps

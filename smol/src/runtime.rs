@@ -1,0 +1,198 @@
+use async_executor::StaticLocalExecutor;
+use async_io::Timer;
+use async_task::Task;
+use futures_lite::{FutureExt, Stream, StreamExt};
+use std::{
+    cell::Cell,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
+use trillium_server_common::{DroppableFuture, Runtime, RuntimeTrait};
+
+thread_local! {
+    /// When a reuseport worker thread installs its own single-threaded executor here, spawns from
+    /// that thread go to it instead of the global executor, keeping each connection's work on the
+    /// core the kernel delivered it to. Empty on every other thread, where spawns fall through to
+    /// the multi-threaded global executor.
+    static WORKER_EXECUTOR: Cell<Option<&'static StaticLocalExecutor>> = const { Cell::new(None) };
+}
+
+fn spawn_on_current_executor<Fut>(fut: Fut) -> Task<Fut::Output>
+where
+    Fut: Future + Send + 'static,
+    Fut::Output: Send + 'static,
+{
+    match WORKER_EXECUTOR.get() {
+        Some(executor) => executor.spawn(fut),
+        None => async_global_executor::spawn(fut),
+    }
+}
+
+/// Drive `fut` to completion on a fresh single-threaded executor installed as this thread's
+/// [`WORKER_EXECUTOR`], so spawns issued from `fut` and its descendants stay on this thread.
+///
+/// The executor is leaked: one per reuseport worker thread, living until process shutdown, which is
+/// what the worker fleet wants and what [`StaticLocalExecutor`] is optimized for.
+#[cfg(all(
+    feature = "reuseport",
+    unix,
+    not(target_os = "solaris"),
+    not(target_os = "illumos"),
+    not(target_os = "cygwin"),
+    not(target_vendor = "apple")
+))]
+pub(crate) fn block_on_worker(fut: impl Future<Output = ()>) {
+    let executor: &'static StaticLocalExecutor = async_executor::LocalExecutor::new().leak();
+    WORKER_EXECUTOR.set(Some(executor));
+    async_io::block_on(executor.run(fut));
+}
+
+/// Runtime for Smol
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SmolRuntime(());
+
+struct DetachOnDrop<Output>(Option<Task<Output>>);
+impl<Output> Future for DetachOnDrop<Output> {
+    type Output = Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(self.0.as_mut().unwrap()).poll(cx)
+    }
+}
+
+impl<Output> Drop for DetachOnDrop<Output> {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.detach();
+        }
+    }
+}
+
+impl RuntimeTrait for SmolRuntime {
+    fn spawn<Fut>(
+        &self,
+        fut: Fut,
+    ) -> DroppableFuture<impl Future<Output = Option<Fut::Output>> + Send + 'static>
+    where
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        let join_handle = DetachOnDrop(Some(spawn_on_current_executor(fut)));
+        DroppableFuture::new(async move { join_handle.catch_unwind().await.ok() })
+    }
+
+    async fn delay(&self, duration: Duration) {
+        Timer::after(duration).await;
+    }
+
+    fn interval(&self, period: Duration) -> impl Stream<Item = ()> + Send + 'static {
+        Timer::interval(period).map(|_| ())
+    }
+
+    fn block_on<Fut: Future>(&self, fut: Fut) -> Fut::Output {
+        async_global_executor::block_on(fut)
+    }
+
+    #[cfg(unix)]
+    fn hook_signals(
+        &self,
+        signals: impl IntoIterator<Item = i32>,
+    ) -> impl Stream<Item = i32> + Send + 'static {
+        use async_signal::{Signal, Signals};
+        use signal_hook::consts::signal::*;
+        let signals: Vec<Signal> = signals
+            .into_iter()
+            .filter_map(|n| match n {
+                SIGHUP => Some(Signal::Hup),
+                SIGINT => Some(Signal::Int),
+                SIGQUIT => Some(Signal::Quit),
+                SIGILL => Some(Signal::Ill),
+                SIGTRAP => Some(Signal::Trap),
+                SIGABRT => Some(Signal::Abort),
+                SIGBUS => Some(Signal::Bus),
+                SIGFPE => Some(Signal::Fpe),
+                SIGKILL => Some(Signal::Kill),
+                SIGUSR1 => Some(Signal::Usr1),
+                SIGSEGV => Some(Signal::Segv),
+                SIGUSR2 => Some(Signal::Usr2),
+                SIGPIPE => Some(Signal::Pipe),
+                SIGALRM => Some(Signal::Alarm),
+                SIGTERM => Some(Signal::Term),
+                SIGCHLD => Some(Signal::Child),
+                SIGCONT => Some(Signal::Cont),
+                SIGSTOP => Some(Signal::Stop),
+                SIGTSTP => Some(Signal::Tstp),
+                SIGTTIN => Some(Signal::Ttin),
+                SIGTTOU => Some(Signal::Ttou),
+                SIGURG => Some(Signal::Urg),
+                SIGXCPU => Some(Signal::Xcpu),
+                SIGXFSZ => Some(Signal::Xfsz),
+                SIGVTALRM => Some(Signal::Vtalarm),
+                SIGPROF => Some(Signal::Prof),
+                SIGWINCH => Some(Signal::Winch),
+                SIGIO => Some(Signal::Io),
+                SIGSYS => Some(Signal::Sys),
+                _ => None,
+            })
+            .collect();
+        Signals::new(signals)
+            .unwrap()
+            .filter_map(|r| r.ok().map(|s| s as i32))
+    }
+}
+
+impl SmolRuntime {
+    /// Spawn a future on the runtime, returning a future that has detach-on-drop semantics
+    ///
+    /// Spawned tasks conform to the following behavior:
+    ///
+    /// * detach on drop: If the returned [`DroppableFuture`] is dropped immediately, the task will
+    ///   continue to execute until completion.
+    ///
+    /// * unwinding: If the spawned future panics, this must not propagate to the join handle.
+    ///   Instead, the awaiting the join handle returns None in case of panic.
+    pub fn spawn<Fut>(
+        &self,
+        fut: Fut,
+    ) -> DroppableFuture<impl Future<Output = Option<Fut::Output>> + Send + 'static + use<Fut>>
+    where
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static,
+    {
+        let join_handle = DetachOnDrop(Some(spawn_on_current_executor(fut)));
+        DroppableFuture::new(async move { join_handle.catch_unwind().await.ok() })
+    }
+
+    /// Wake in this amount of wall time
+    pub async fn delay(&self, duration: Duration) {
+        Timer::after(duration).await;
+    }
+
+    /// Returns a [`Stream`] that yields a `()` on the provided period
+    pub fn interval(&self, period: Duration) -> impl Stream<Item = ()> + Send + 'static + use<> {
+        Timer::interval(period).map(|_| ())
+    }
+
+    /// Runtime implementation hook for blocking on a top level future.
+    pub fn block_on<Fut: Future>(&self, fut: Fut) -> Fut::Output {
+        RuntimeTrait::block_on(self, fut)
+    }
+
+    /// Race a future against the provided duration, returning None in case of timeout.
+    pub async fn timeout<Fut>(&self, duration: Duration, fut: Fut) -> Option<Fut::Output>
+    where
+        Fut: Future + Send,
+        Fut::Output: Send + 'static,
+    {
+        RuntimeTrait::timeout(self, duration, fut).await
+    }
+}
+
+impl From<SmolRuntime> for Runtime {
+    fn from(value: SmolRuntime) -> Self {
+        Arc::new(value).into()
+    }
+}

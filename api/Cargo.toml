@@ -1,0 +1,48 @@
+[package]
+name = "trillium-api"
+version = "0.3.0"
+authors = ["Jacob Rothstein <hi@jbr.me>"]
+edition = "2024"
+description = "an api handler for trillium.rs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/trillium-rs/trillium"
+readme = "README.md"
+keywords = ["trillium", "framework", "async"]
+categories = ["web-programming::http-server", "web-programming"]
+
+[features]
+default = []
+forms = ["serde_urlencoded", "form_urlencoded"]
+url = ["dep:url"]
+serde_json = ["dep:serde_json"]
+sonic-rs = ["dep:sonic-rs"]
+
+[dependencies]
+form_urlencoded = { version = "1.2.2", optional = true }
+log = "0.4.29"
+mime = "0.3.17"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.149", optional = true }
+serde_path_to_error = "0.1.20"
+serde_urlencoded = { version = "0.7.1", optional = true }
+sonic-rs = { version = "0.5.8", optional = true }
+thiserror = "2.0.18"
+trillium.workspace = true
+trillium-macros.workspace = true
+url = { version = "2.5.8", optional = true }
+
+[dev-dependencies]
+async-io = "2.6.0"
+env_logger = "0.11.10"
+serde = { version = "1.0.228", features = ["derive"] }
+trillium-logger = { path = "../logger" }
+trillium-router = { path = "../router" }
+trillium-smol = { path = "../smol" }
+trillium-testing = { path = "../testing" }
+trillium-api = { path = ".", features = ["url", "sonic-rs", "forms"] }
+test-harness = "0.3.1"
+async-channel = "2.5.0"
+
+[package.metadata.docs.rs]
+features = ["forms", "url", "sonic-rs"]
+rustdoc-args = ["--cfg", "docsrs"]

@@ -1,0 +1,20 @@
+[package]
+name = "trillium-method-override"
+version = "0.3.0"
+authors = ["Jacob Rothstein <hi@jbr.me>"]
+edition = "2024"
+description = "http method override for trillium.rs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/trillium-rs/trillium"
+readme = "README.md"
+keywords = ["trillium", "framework", "async"]
+categories = ["web-programming::http-server", "web-programming"]
+
+[dependencies]
+trillium.workspace = true
+querystrong = "0.4.0"
+trillium-http.workspace = true
+
+[dev-dependencies]
+trillium-smol = { path = "../smol" }
+trillium-testing = { path = "../testing" }

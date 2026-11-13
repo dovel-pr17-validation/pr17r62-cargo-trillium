@@ -1,0 +1,51 @@
+[package]
+name = "trillium-websockets"
+version = "0.9.3"
+edition = "2024"
+description = "websocket support for trillium.rs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/trillium-rs/trillium"
+readme = "README.md"
+keywords = ["trillium", "framework", "async"]
+categories = ["web-programming::http-server", "web-programming"]
+
+[package.metadata.docs.rs]
+features = ["json"]
+
+[features]
+default = []
+json = ["serde_json", "serde"]
+
+[dependencies]
+# Only re-exported; remove at the next breaking release.
+async-tungstenite = { version = "0.35.0", default-features = false, features = [
+    "futures-03-sink",
+] }
+base64 = "0.23.0"
+fastrand = "2.3.0"
+futures-lite = "2.6.1"
+log = "0.4.29"
+pin-project-lite = "0.2.17"
+serde = { version = "1.0.228", optional = true }
+serde_json = { version = "1.0.149", optional = true }
+sha1 = "0.11.0"
+swansong = "0.3.7"
+thiserror = "2.0.18"
+trillium.workspace = true
+trillium-http = { version = "1.3.9", path = "../http" }
+tungstenite = { version = "0.30.0", default-features = false }
+url = "2.5.8"
+
+[dev-dependencies]
+async-tungstenite = { version = "0.35.0", default-features = false, features = ["handshake"] }
+serde = { version = "1.0.228", features = ["derive"] }
+async-channel = "2.5.0"
+async-net = "2.0.0"
+broadcaster = "1.0.0"
+trillium-client = { path = "../client", features = ["websockets"] }
+trillium-smol = { path = "../smol" }
+trillium-testing = { path = "../testing" }
+trillium-websockets = { features = ["json"], path = "." }
+trillium-logger = { path = "../logger" }
+env_logger = "0.11.10"
+

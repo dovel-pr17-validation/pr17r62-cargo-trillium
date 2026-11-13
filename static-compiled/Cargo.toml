@@ -1,0 +1,35 @@
+[package]
+name = "trillium-static-compiled"
+version = "0.7.0"
+edition = "2024"
+description = "compile-time static assets for trillium.rs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/trillium-rs/trillium"
+readme = "README.md"
+keywords = ["trillium", "framework", "async"]
+categories = ["web-programming::http-server", "web-programming"]
+
+[package.metadata.cargo-udeps.ignore]
+development = ["trillium-testing"]
+
+[dependencies]
+log = "0.4.29"
+mime = "0.3.17"
+mime_guess = "2.0.5"
+trillium.workspace = true
+httpdate = "1.0.3"
+trillium-static-compiled-macros.workspace = true
+
+[dev-dependencies]
+etag = { version = "4.0.0", features = ["std"] }
+trillium-caching-headers = { path = "../caching-headers" }
+trillium-logger = { path = "../logger" }
+trillium-smol = { path = "../smol" }
+trillium-testing = { path = "../testing" }
+
+[features]
+default = []
+compression = ["brotli", "zstd", "gzip"]
+brotli = ["trillium-static-compiled-macros/brotli"]
+zstd = ["trillium-static-compiled-macros/zstd"]
+gzip = ["trillium-static-compiled-macros/gzip"]

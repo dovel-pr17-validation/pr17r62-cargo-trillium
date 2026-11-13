@@ -1,0 +1,133 @@
+// The corpus golden files encode the request parser's behavior (notably synthesizing a
+// `400` response for malformed requests rather than closing).
+use indoc::formatdoc;
+use pretty_assertions::assert_str_eq;
+use std::{env, net::Shutdown, path::PathBuf, sync::Arc};
+use test_harness::test;
+use trillium_http::{Conn, HttpContext, KnownHeaderName, Swansong};
+use trillium_testing::{RuntimeTrait, TestTransport, harness};
+const TEST_DATE: &str = "Tue, 21 Nov 2023 21:27:21 GMT";
+
+async fn handler(mut conn: Conn<TestTransport>) -> Conn<TestTransport> {
+    let response_body = formatdoc! {"
+        ===request===
+        method: {method}
+        path: {path}
+        version: {version}
+
+        ===headers===
+        {headers}
+        ",
+        method = conn.method(),
+        path = conn.path(),
+        version = conn.http_version(),
+        headers = conn.request_headers()
+    };
+
+    conn.response_headers_mut()
+        .insert(KnownHeaderName::Date, TEST_DATE);
+    conn.response_headers_mut()
+        .insert(KnownHeaderName::Server, "corpus-test");
+
+    match conn.request_body().read_string().await {
+        Ok(request_body) => {
+            conn.set_status(200);
+            let trailer_section = conn
+                .request_trailers()
+                .as_ref()
+                .map(|t| format!("\n===trailers===\n{t}\n"))
+                .unwrap_or_default();
+            conn.set_response_body(format!(
+                "{response_body}===body===\n{request_body}{trailer_section}"
+            ));
+        }
+
+        Err(e) => {
+            conn.set_status(500);
+            conn.set_response_body(format!("{response_body}===error===\n{e}"));
+        }
+    };
+
+    conn
+}
+
+fn normalize_date(response: &str) -> String {
+    response
+        .split("\r\n")
+        .map(|line| {
+            if line.starts_with("Date: ") {
+                format!("Date: {TEST_DATE}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n")
+}
+
+#[test(harness)]
+async fn corpus_test() {
+    let runtime = trillium_testing::runtime();
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
+    let filter = env::var("CORPUS_TEST_FILTER").unwrap_or_default();
+    let corpus_request_files = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|f| {
+            let path = f.unwrap().path();
+            if path.extension().and_then(|x| x.to_str()) == Some("request") {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .filter(|f| f.to_str().unwrap().contains(&filter));
+
+    for file in corpus_request_files {
+        let request = std::fs::read_to_string(&file)
+            .unwrap_or_else(|_| panic!("could not read {}", file.display()))
+            .replace(['\r', '\n'], "")
+            .replace("\\r", "\r")
+            .replace("\\n", "\n")
+            .replace("\\0", "\0");
+
+        let (client, server) = TestTransport::new();
+        let swansong = Swansong::new();
+        let context = Arc::new(HttpContext::new());
+        let res = runtime.spawn({
+            let context = context.clone();
+            async move { context.run(server, handler).await }
+        });
+
+        client.write_all(request);
+        client.shutdown(Shutdown::Write);
+        let (response, extension) = match res.await.unwrap() {
+            Ok(None) => (client.read_available_string().await, "response"),
+            Err(e) => (e.to_string(), "error"),
+            Ok(Some(_)) => ("".to_string(), "upgrade"),
+        };
+
+        // Synthesized error responses (e.g. a `400` for a malformed request) don't run the handler,
+        // so `send()` stamps a live Date rather than the fixed `TEST_DATE`. Pin it for reproducible
+        // goldens; a no-op for handler responses, which already set `TEST_DATE`.
+        let response = normalize_date(&response);
+
+        let response_file = file.with_extension(extension);
+
+        if option_env!("CORPUS_TEST_WRITE").is_some() {
+            std::fs::write(
+                response_file,
+                response.replace('\r', "\\r").replace('\n', "\\n\n"),
+            )
+            .unwrap();
+        } else {
+            let expected_response = std::fs::read_to_string(response_file)
+                .unwrap()
+                .replace(['\n', '\r'], "")
+                .replace("\\r", "\r")
+                .replace("\\n", "\n");
+            assert_str_eq!(expected_response, response, "\n\n{file:?}");
+        }
+
+        swansong.shut_down();
+    }
+}

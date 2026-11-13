@@ -1,0 +1,437 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![forbid(unsafe_code)]
+#![warn(
+    rustdoc::missing_crate_level_docs,
+    missing_docs,
+    nonstandard_style,
+    unused_qualifications
+)]
+
+//! Request logging for [`trillium`].
+//!
+//! [`Logger`] is a [`Handler`] that emits one line per request. Add it to a handler tuple ahead of
+//! the handlers whose work you want to time and observe:
+//!
+//! ```
+//! use trillium_logger::logger;
+//! let handler = (logger(), "hello");
+//! ```
+//!
+//! Out of the box it uses [`dev_formatter`], a compact colorized development format. To customize
+//! the line, hand [`Logger::with_formatter`] a format built from the components in [`formatters`].
+//!
+//! The line is emitted when the response completes. [`Logger::with_start_logging`] adds a second
+//! line when each request is received, so that requests that never complete still leave a record.
+//!
+//! # The `log_format!` macro
+//!
+//! [`log_format!`] builds a formatter from a [`format_args!`]-style string. Bare `{name}`
+//! placeholders refer to the building blocks in [`formatters`]; literal text between them is
+//! emitted verbatim:
+//!
+//! ```
+//! use trillium_logger::{Logger, log_format};
+//! Logger::new().with_formatter(log_format!("{method} {url} -> {status}"));
+//! ```
+//!
+//! Anything that isn't a bare built-in — a formatter that takes arguments, a closure, a value from
+//! your own crate — is supplied as a named or positional argument, exactly as in [`format_args!`]:
+//!
+//! ```
+//! use trillium::KnownHeaderName::UserAgent;
+//! use trillium_logger::{Logger, formatters::request_header, log_format};
+//! Logger::new().with_formatter(log_format!(
+//!     "{ip} \"{method} {url}\" {status} {ua}",
+//!     ua = request_header(UserAgent),
+//! ));
+//! ```
+//!
+//! The macro expands to the same composable [`LogFormatter`] tuples you can also build by hand; see
+//! that trait for the lower-level interface and for writing your own components.
+
+#[cfg(test)]
+#[doc = include_str!("../README.md")]
+mod readme {}
+pub use crate::formatters::{
+    DevFormatter, StartFormatter, apache_combined, apache_common, dev_formatter, start_formatter,
+};
+use std::{
+    convert::AsMut,
+    fmt::{Display, Write},
+    io::IsTerminal,
+    sync::Arc,
+};
+use trillium::{Conn, Handler, Info, ListenerKind, Transport};
+pub use trillium_logger_macros::log_format;
+/// Components with which common log formats can be constructed
+pub mod formatters;
+
+#[cfg(feature = "client")]
+#[cfg_attr(docsrs, doc(cfg(feature = "client")))]
+pub mod client;
+
+/// A configuration option that determines if format will be colorful.
+///
+/// The default is [`ColorMode::Auto`], which only enables color if stdout
+/// is detected to be a shell terminal (tty). If this detection is
+/// incorrect, you can explicitly set it to [`ColorMode::On`] or
+/// [`ColorMode::Off`]
+///
+/// **Note**: The actual colorization of output is determined by the log
+/// formatters, so it is possible for this to be correctly enabled but for
+/// the output to have no colored components.
+
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+#[derive(Default)]
+pub enum ColorMode {
+    /// detect if stdout is a tty
+    #[default]
+    Auto,
+    /// always enable colorful output
+    On,
+    /// always disable colorful output
+    Off,
+}
+
+impl ColorMode {
+    pub(crate) fn is_enabled(&self) -> bool {
+        match self {
+            ColorMode::Auto => std::io::stdout().is_terminal(),
+            ColorMode::On => true,
+            ColorMode::Off => false,
+        }
+    }
+}
+
+/// Specifies where the logger output should be sent
+///
+/// The default is [`Target::Stdout`].
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+#[derive(Default)]
+pub enum Target {
+    /// Send trillium logger output to a log crate backend. See
+    /// [`log`] for output options
+    Logger(log::Level),
+
+    /// Send trillium logger output to stdout
+    #[default]
+    Stdout,
+}
+
+/// A trait for log targets. Implemented for [`Target`] and for all
+/// `Fn(String) + Send + Sync + 'static`.
+pub trait Targetable: Send + Sync + 'static {
+    /// write a log line
+    fn write(&self, data: String);
+}
+
+impl Targetable for Target {
+    fn write(&self, data: String) {
+        match self {
+            Target::Logger(level) => {
+                log::log!(*level, "{}", data);
+            }
+
+            Target::Stdout => {
+                println!("{data}");
+            }
+        }
+    }
+}
+
+impl<F> Targetable for F
+where
+    F: Fn(String) + Send + Sync + 'static,
+{
+    fn write(&self, data: String) {
+        self(data);
+    }
+}
+
+/// The interface to format a &[`Conn`] as a [`Display`]-able output
+///
+/// In general, the included loggers provide a mechanism for composing
+/// these, so top level formats like [`dev_formatter`], [`apache_common`]
+/// and [`apache_combined`] are composed in terms of component formatters
+/// like [`formatters::method`], [`formatters::ip`],
+/// [`formatters::timestamp`], and many others (see [`formatters`] for a
+/// full list)
+///
+/// When implementing this trait, note that [`Display::fmt`] is called on
+/// [`LogFormatter::Output`] _after_ the response has been fully sent, but
+/// that the [`LogFormatter::format`] is called _before_ the response has
+/// been sent. If you need to perform timing-sensitive calculations that
+/// represent the full http cycle, move whatever data is needed to make
+/// the calculation into a new type that implements Display, ensuring that
+/// it is calculated at the right time.
+///
+///
+/// Most formats are more conveniently expressed with the [`log_format!`](crate::log_format) macro,
+/// which expands to the tuple composition described below. Reach for the implementations here when
+/// you want a named, reusable formatter or are writing your own component.
+///
+/// ## Implementations
+///
+/// ### Tuples
+///
+/// LogFormatter is implemented for all tuples of other LogFormatter
+/// types, from 2-26 formatters long. The output of these formatters is
+/// concatenated with no space between.
+///
+/// ### `&'static str`
+///
+/// LogFormatter is implemented for &'static str, allowing for
+/// interspersing spaces and other static formatting details into tuples.
+///
+/// ```rust
+/// use trillium_logger::{Logger, formatters};
+/// let handler = Logger::new().with_formatter(("-> ", formatters::method, " ", formatters::url));
+/// ```
+///
+/// ### `Fn(&Conn, bool) -> impl Display`
+///
+/// LogFormatter is implemented for all functions that conform to this signature.
+///
+/// ```rust
+/// # use trillium_logger::{Logger, dev_formatter};
+/// # use trillium::Conn;
+/// # use std::borrow::Cow;
+/// # struct User(String); impl User { fn name(&self) -> &str { &self.0 } }
+/// fn user(conn: &Conn, color: bool) -> Cow<'static, str> {
+///     match conn.state::<User>() {
+///         Some(user) => String::from(user.name()).into(),
+///         None => "guest".into(),
+///     }
+/// }
+///
+/// let handler = Logger::new().with_formatter((dev_formatter, " ", user));
+/// ```
+pub trait LogFormatter: Send + Sync + 'static {
+    /// The display type for this formatter
+    ///
+    /// For a simple formatter, this will likely be a String, or even
+    /// better, a lightweight type that implements Display.
+    type Output: Display + Send + Sync + 'static;
+
+    /// Extract Output from this Conn
+    fn format(&self, conn: &Conn, color: bool) -> Self::Output;
+}
+
+/// The trillium handler for this crate, and the core type
+pub struct Logger<F, S = StartFormatter> {
+    format: F,
+    start_format: S,
+    start_logging: bool,
+    color_mode: ColorMode,
+    target: Arc<dyn Targetable>,
+    init_message: bool,
+}
+
+impl Logger<()> {
+    /// Builds a new logger
+    ///
+    /// Defaults:
+    ///
+    /// * formatter: [`DevFormatter`]
+    /// * color mode: [`ColorMode::Auto`]
+    /// * target: [`Target::Stdout`]
+    /// * init message: true
+    /// * start logging: disabled (see [`Logger::with_start_logging`])
+    pub fn new() -> Logger<DevFormatter> {
+        Logger {
+            format: DevFormatter,
+            start_format: StartFormatter,
+            start_logging: false,
+            color_mode: ColorMode::Auto,
+            target: Arc::new(Target::Stdout),
+            init_message: true,
+        }
+    }
+}
+
+impl<T, S> Logger<T, S> {
+    /// replace the formatter with any type that implements [`LogFormatter`]
+    ///
+    /// see the trait documentation for [`LogFormatter`] for more details. note that this can be
+    /// chained with [`Logger::with_target`] and [`Logger::with_color_mode`]
+    ///
+    /// ```
+    /// use trillium_logger::{Logger, apache_common};
+    /// Logger::new().with_formatter(apache_common("-", "-"));
+    /// ```
+    pub fn with_formatter<Formatter: LogFormatter>(
+        self,
+        formatter: Formatter,
+    ) -> Logger<Formatter, S> {
+        Logger {
+            format: formatter,
+            start_format: self.start_format,
+            start_logging: self.start_logging,
+            color_mode: self.color_mode,
+            target: self.target,
+            init_message: self.init_message,
+        }
+    }
+
+    /// replace the request-start formatter, enabling start logging as if by
+    /// [`Logger::with_start_logging`]
+    ///
+    /// Completion-oriented components like [`formatters::status`] and
+    /// [`formatters::response_time`] do not have meaningful values when the start line is
+    /// formatted, as no handlers have run yet.
+    ///
+    /// ```
+    /// use trillium_logger::{Logger, log_format};
+    /// Logger::new().with_start_formatter(log_format!("Started {method} {url}"));
+    /// ```
+    pub fn with_start_formatter<Formatter: LogFormatter>(
+        self,
+        start_formatter: Formatter,
+    ) -> Logger<T, Formatter> {
+        Logger {
+            format: self.format,
+            start_format: start_formatter,
+            start_logging: true,
+            color_mode: self.color_mode,
+            target: self.target,
+            init_message: self.init_message,
+        }
+    }
+}
+
+impl<F, S> Logger<F, S> {
+    /// specify the color mode for this logger.
+    ///
+    /// see [`ColorMode`] for more details. note that this can be chained
+    /// with [`Logger::with_target`] and [`Logger::with_formatter`]
+    /// ```
+    /// use trillium_logger::{ColorMode, Logger};
+    /// Logger::new().with_color_mode(ColorMode::On);
+    /// ```
+    pub fn with_color_mode(mut self, color_mode: ColorMode) -> Self {
+        self.color_mode = color_mode;
+        self
+    }
+
+    /// specify the logger target
+    ///
+    /// see [`Target`] for more details. note that this can be chained
+    /// with [`Logger::with_color_mode`] and [`Logger::with_formatter`]
+    ///
+    /// ```
+    /// use trillium_logger::{Logger, Target};
+    /// Logger::new().with_target(Target::Logger(log::Level::Info));
+    /// ```
+    pub fn with_target(mut self, target: impl Targetable) -> Self {
+        self.target = Arc::new(target);
+        self
+    }
+
+    /// Opt out of the init message
+    pub fn without_init_message(mut self) -> Self {
+        self.init_message = false;
+        self
+    }
+
+    /// Also emit a log line when each request is received, before downstream handlers run
+    ///
+    /// The start line is rendered by [`StartFormatter`] as `Started {version} {method} {url}`
+    /// unless replaced with [`Logger::with_start_formatter`]. The completion line is unaffected.
+    ///
+    /// Start and completion lines from concurrent requests interleave; to pair them up, include a
+    /// request identifier in both formatters.
+    ///
+    /// ```
+    /// use trillium_logger::Logger;
+    /// Logger::new().with_start_logging();
+    /// ```
+    pub fn with_start_logging(mut self) -> Self {
+        self.start_logging = true;
+        self
+    }
+}
+
+/// An easily-named `Arc<dyn Targetable>` that is stored in trillium shared state
+#[derive(Clone)]
+pub struct LogTarget(Arc<dyn Targetable>);
+impl Targetable for LogTarget {
+    fn write(&self, data: String) {
+        self.0.write(data);
+    }
+}
+impl LogTarget {
+    /// Emit a log message to the logging backend
+    pub fn write(&self, data: String) {
+        self.0.write(data);
+    }
+}
+
+struct LoggerWasRun;
+
+impl<F, S> Handler for Logger<F, S>
+where
+    F: LogFormatter,
+    S: LogFormatter,
+{
+    async fn init(&mut self, info: &mut Info) {
+        if self.init_message {
+            let mut string = "\nTrillium started\n".to_string();
+
+            // The canonical URL, when known, can differ from any bound address (e.g. a configured
+            // DNS name behind a load balancer), so it is reported separately from the sockets.
+            if let Some(url) = info.shared_state::<url::Url>() {
+                writeln!(string, "✾ Listening at {}", url.as_str()).unwrap();
+            }
+
+            // A TCP-TLS listener and a QUIC listener on the same address render to the same URL;
+            // collapse them onto one line, marking `h3` where a QUIC listener is part of the group.
+            let mut bound: Vec<(String, bool)> = Vec::new();
+            for listener in info.listeners() {
+                let rendered = listener.to_string();
+                let is_h3 = matches!(listener.kind(), ListenerKind::Quic(_));
+                if let Some((_, h3)) = bound.iter_mut().find(|(r, _)| *r == rendered) {
+                    *h3 |= is_h3;
+                } else {
+                    bound.push((rendered, is_h3));
+                }
+            }
+            for (rendered, is_h3) in &bound {
+                let h3 = if *is_h3 { " (h3)" } else { "" };
+                writeln!(string, "✾ Bound to {rendered}{h3}").unwrap();
+            }
+
+            writeln!(string, "Control-c to quit").unwrap();
+            self.target.write(string);
+        }
+
+        info.insert_shared_state(LogTarget(Arc::clone(&self.target)));
+    }
+
+    async fn run(&self, conn: Conn) -> Conn {
+        if self.start_logging {
+            let output = self
+                .start_format
+                .format(&conn, self.color_mode.is_enabled());
+            self.target.write(output.to_string());
+        }
+        conn.with_state(LoggerWasRun)
+    }
+
+    async fn before_send(&self, mut conn: Conn) -> Conn {
+        if conn.state::<LoggerWasRun>().is_some() {
+            let target = self.target.clone();
+            let output = self.format.format(&conn, self.color_mode.is_enabled());
+            let inner: &mut trillium_http::Conn<Box<dyn Transport>> = conn.as_mut();
+            inner.after_send(move |_| target.write(output.to_string()));
+        }
+
+        conn
+    }
+}
+
+/// Convenience alias for [`Logger::new`]
+pub fn logger() -> Logger<DevFormatter> {
+    Logger::new()
+}

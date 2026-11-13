@@ -1,0 +1,162 @@
+use futures_lite::{StreamExt, stream};
+use trillium_client::{Client, EventStream, SseErrorKind};
+use trillium_http::Status;
+use trillium_sse::{Event as ServerEvent, sse};
+use trillium_testing::client_config;
+
+#[test]
+fn round_trip_through_trillium_sse() {
+    let handler = sse(|_: &mut trillium::Conn| {
+        stream::iter(vec![
+            ServerEvent::new("first"),
+            ServerEvent::new("second line one\nsecond line two").with_type("custom"),
+            ServerEvent::new("third"),
+        ])
+    });
+
+    let client = Client::new(client_config());
+
+    trillium_testing::with_server(handler, move |url| async move {
+        let mut events = client.get(url).into_sse().await?;
+
+        let first = events.next().await.expect("first")?;
+        assert_eq!(first.data(), "first");
+        assert_eq!(first.event_type(), None);
+
+        let second = events.next().await.expect("second")?;
+        assert_eq!(second.data(), "second line one\nsecond line two");
+        assert_eq!(second.event_type(), Some("custom"));
+
+        let third = events.next().await.expect("third")?;
+        assert_eq!(third.data(), "third");
+
+        assert!(events.next().await.is_none());
+        Ok(())
+    });
+}
+
+#[test]
+fn event_stream_exposes_the_conn_for_response_metadata() {
+    let handler = sse(|conn: &mut trillium::Conn| {
+        conn.response_headers_mut().insert("x-session", "abc123");
+        stream::iter(vec![ServerEvent::new("only")])
+    });
+    let client = Client::new(client_config());
+
+    trillium_testing::with_server(handler, move |url| async move {
+        let mut events = client.get(url).into_sse().await?;
+
+        assert_eq!(events.conn().status(), Some(Status::Ok));
+        assert_eq!(
+            events.conn().response_headers().get_str("x-session"),
+            Some("abc123")
+        );
+
+        // The body belongs to the stream: events still arrive after inspecting the conn.
+        let only = events.next().await.expect("only")?;
+        assert_eq!(only.data(), "only");
+        assert!(events.next().await.is_none());
+        Ok(())
+    });
+}
+
+#[test]
+fn non_success_status_is_recoverable() {
+    let handler = |conn: trillium::Conn| async move { conn.with_status(404).with_body("nope") };
+    let client = Client::new(client_config());
+
+    trillium_testing::with_server(handler, move |url| async move {
+        let err = client
+            .get(url)
+            .into_sse()
+            .await
+            .expect_err("expected a 404");
+        assert!(matches!(err.kind, SseErrorKind::Status(Status::NotFound)));
+
+        let mut conn = trillium_client::Conn::from(err);
+        assert_eq!(conn.response_body().read_string().await?, "nope");
+        Ok(())
+    });
+}
+
+#[test]
+fn wrong_content_type_is_recoverable() {
+    let handler = |conn: trillium::Conn| async move {
+        conn.with_response_header(trillium::KnownHeaderName::ContentType, "text/plain")
+            .ok("data: not really sse\n\n")
+    };
+    let client = Client::new(client_config());
+
+    trillium_testing::with_server(handler, move |url| async move {
+        let err = client
+            .get(url)
+            .into_sse()
+            .await
+            .expect_err("expected wrong content-type");
+        assert!(matches!(err.kind, SseErrorKind::UnexpectedContentType(_)));
+        Ok(())
+    });
+}
+
+#[test]
+fn a_missing_content_type_is_rejected_but_recoverable() {
+    let handler = |mut conn: trillium::Conn| async move {
+        conn.response_headers_mut()
+            .remove(trillium::KnownHeaderName::ContentType);
+        conn.with_body("data: unlabeled\n\n").with_status(200)
+    };
+    let client = Client::new(client_config());
+
+    trillium_testing::with_server(handler, move |url| async move {
+        let err = client.get(url).into_sse().await.unwrap_err();
+        assert!(matches!(
+            err.kind,
+            SseErrorKind::UnexpectedContentType(None)
+        ));
+
+        let mut events = EventStream::new(err.into())?;
+        let event = events.next().await.expect("an event")?;
+        assert_eq!(event.data(), "unlabeled");
+        Ok(())
+    });
+}
+
+#[test]
+fn event_stream_new_requires_an_executed_conn() {
+    let client = Client::new(client_config());
+    let err = EventStream::new(client.get("http://localhost/")).unwrap_err();
+    assert!(matches!(err.kind, SseErrorKind::NoBody));
+}
+
+#[test]
+fn an_explicit_accept_is_preserved() {
+    let handler = |mut conn: trillium::Conn| async move {
+        let accept = conn
+            .request_headers()
+            .get_str("accept")
+            .unwrap_or_default()
+            .to_string();
+        conn.insert_response_header("content-type", "text/event-stream");
+        conn.ok(format!("data: {accept}\n\n"))
+    };
+    let client = Client::new(client_config());
+
+    trillium_testing::with_server(handler, move |url| async move {
+        let mut events = client
+            .get(url.clone())
+            .with_request_header("accept", "text/event-stream, application/x-custom")
+            .into_sse()
+            .await?;
+        assert_eq!(
+            events.next().await.expect("event")?.data(),
+            "text/event-stream, application/x-custom"
+        );
+
+        let mut events = client.get(url).into_sse().await?;
+        assert_eq!(
+            events.next().await.expect("event")?.data(),
+            "text/event-stream"
+        );
+        Ok(())
+    });
+}

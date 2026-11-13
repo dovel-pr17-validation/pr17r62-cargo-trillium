@@ -1,0 +1,146 @@
+use crate::{HeaderName, Status, Version};
+use std::{num::TryFromIntError, str::Utf8Error, time::Duration};
+use thiserror::Error;
+
+/// Concrete errors that occur within trillium's HTTP implementation
+#[derive(Error, Debug)]
+#[non_exhaustive]
+pub enum Error {
+    /// [`std::io::Error`]
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    /// this error describes a malformed request with a path that does
+    /// not start with / or http:// or https://
+    #[error("Unexpected uri format")]
+    UnexpectedUriFormat,
+
+    /// the relevant HTTP protocol expected this header, but it was
+    /// not provided
+    #[error("Mandatory {0} header missing")]
+    HeaderMissing(HeaderName<'static>),
+
+    /// this error describes a request that does not specify a path
+    #[error("Request path missing")]
+    RequestPathMissing,
+
+    /// connection was closed
+    #[error("Connection closed by client")]
+    Closed,
+
+    /// [`TryFromIntError`]
+    #[error(transparent)]
+    TryFromIntError(#[from] TryFromIntError),
+
+    /// An incomplete or invalid HTTP head
+    #[error("Partial or invalid HTTP head")]
+    InvalidHead,
+
+    /// We were unable to parse a [`HeaderName`][crate::HeaderName]
+    #[error("Invalid or unparseable header name")]
+    InvalidHeaderName,
+
+    /// We were unable to parse a [`HeaderValue`][crate::HeaderValue]
+    #[error("Invalid or unparseable header value, header name: {0}")]
+    InvalidHeaderValue(HeaderName<'static>),
+
+    /// we were able to parse this [`Version`], but we do not support it
+    #[error("Unsupported version {0}")]
+    UnsupportedVersion(Version),
+
+    /// A request named a well-formed HTTP version that this implementation doesn't speak, such as
+    /// `HTTP/2.0` or `HTTP/0.9` in an HTTP/1.x request-line.
+    #[error("Unsupported HTTP version {major}.{minor}")]
+    UnsupportedVersionNumber {
+        /// The major version digit
+        major: u8,
+        /// The minor version digit
+        minor: u8,
+    },
+
+    /// We were unable to parse a [`Version`]
+    #[error("Invalid or missing version")]
+    InvalidVersion,
+
+    /// we were unable to parse this method
+    #[error("Unsupported method {0}")]
+    UnrecognizedMethod(String),
+
+    /// this request did not have a method
+    #[error("Missing method")]
+    MissingMethod,
+
+    /// the request carried an `Expect` value that we do not handle
+    #[error("Unsupported expectation")]
+    ExpectationFailed,
+
+    /// this request did not have a status code
+    #[error("Missing status code")]
+    MissingStatus,
+
+    /// we were unable to parse a [`Status`](crate::Status)
+    #[error("Invalid status code")]
+    InvalidStatus,
+
+    /// we expected utf8, but there was an encoding error
+    #[error(transparent)]
+    EncodingError(#[from] Utf8Error),
+
+    /// we either received a header that does not make sense in context
+    #[error("Unexpected header: {0}")]
+    UnexpectedHeader(HeaderName<'static>),
+
+    /// to mitigate against malicious HTTP clients, we do not allow request headers beyond this
+    /// length.
+    #[error("Headers were malformed or longer than allowed")]
+    HeadersTooLong,
+
+    /// to mitigate against malicious HTTP clients, we do not read received bodies beyond this
+    /// length to memory. If you need to receive longer bodies, use the Stream or `AsyncRead`
+    /// implementation on `ReceivedBody`
+    #[error("Received body too long. Maximum {0} bytes")]
+    ReceivedBodyTooLong(u64),
+
+    /// something took longer than was allowed
+    #[error("{0} took longer than {1:?}")]
+    TimedOut(&'static str, Duration),
+
+    /// HTTP/2 peer has not advertised `SETTINGS_ENABLE_CONNECT_PROTOCOL = 1`, so an
+    /// extended-CONNECT request cannot be sent on this connection.
+    #[error("HTTP/2 peer does not support extended CONNECT")]
+    ExtendedConnectUnsupported,
+
+    /// An error from middleware or other application-level code, type-erased into a boxed
+    /// error so it can flow through the protocol error type.
+    ///
+    /// Use `error.downcast_ref::<MyError>()` to recover the concrete type — for example,
+    /// `error.downcast_ref::<trillium_redirect::client::RedirectError>()` to inspect a
+    /// follow-redirects failure.
+    #[error(transparent)]
+    Other(Box<dyn std::error::Error + Send + Sync>),
+}
+
+impl From<&Error> for Status {
+    fn from(error: &Error) -> Self {
+        match error {
+            Error::UnrecognizedMethod(_) => Status::NotImplemented,
+            Error::ExpectationFailed => Status::ExpectationFailed,
+            Error::HeadersTooLong => Status::RequestHeaderFieldsTooLarge,
+            Error::UnsupportedVersion(_) | Error::UnsupportedVersionNumber { .. } => {
+                Status::HttpVersionNotSupported
+            }
+            Error::Other(_) => Status::InternalServerError,
+            _ => Status::BadRequest,
+        }
+    }
+}
+
+/// this crate's result type
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    /// Construct an Other variant
+    pub fn other(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::Other(Box::new(error))
+    }
+}

@@ -1,0 +1,30 @@
+[package]
+name = "trillium-native-tls"
+version = "0.6.4"
+edition = "2024"
+description = "native-tls adapter for trillium.rs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/trillium-rs/trillium"
+readme = "README.md"
+keywords = ["trillium", "framework", "async"]
+categories = ["web-programming::http-server", "web-programming"]
+
+[dependencies]
+async-native-tls = "0.6.0"
+native-tls = "0.2.18"
+p12 = "0.6.3"
+pem = "4"
+pkcs8 = { version = "0.11", features = ["alloc"] }
+sec1 = "0.8"
+trillium-server-common = { version = "0.7.14", path = "../server-common" }
+
+[dev-dependencies]
+env_logger = "0.11.10"
+portpicker = "0.1.1"
+rcgen = "0.14"
+test-harness = "0.3.1"
+trillium = { path = "../trillium" }
+trillium-client = { path = "../client" }
+trillium-rustls = { path = "../rustls" }
+trillium-smol = { path = "../smol" }
+trillium-testing = { path = "../testing" }

@@ -1,0 +1,8 @@
+coverage:
+  range: 0..100
+  status:
+    patch: off
+    changes: false
+    project:
+      default:
+        informational: true

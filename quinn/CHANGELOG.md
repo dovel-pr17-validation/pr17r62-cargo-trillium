@@ -1,0 +1,86 @@
+# Changelog
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.1.8] - 2026-11-06
+
+### Added
+
+- `ClientQuicConfig` implements `Default`. With the new `platform-verifier` feature (enabled by
+  default) it verifies servers with `rustls-platform-verifier` — the operating system's trust store
+  on macOS, iOS, Windows, and Android, and the system CA bundle (or `SSL_CERT_FILE` /
+  `SSL_CERT_DIR`, when set) on Linux and other Unix systems. Without the feature, it trusts the
+  bundled WebPKI roots.
+
+### Changed
+
+- `ClientQuicConfig::with_webpki_roots` no longer requires the `webpki-roots` feature, which now
+  does nothing.
+- No longer depends on the unmaintained `rustls-pemfile` crate
+  ([RUSTSEC-2025-0134](https://rustsec.org/advisories/RUSTSEC-2025-0134)). PEM parsing behaves as
+  before.
+
+## [0.1.7] - 2026-09-01
+
+### Added
+
+- `QuicTransportSend::stopped` is implemented over `quinn::SendStream::stopped`, so
+  `Conn::is_disconnected`, `Conn::cancel_on_disconnect`, and `Upgrade::poll_closed` detect
+  peer departure on HTTP/3. A cancelled request is reported within a round trip; a client
+  that vanishes without signalling is reported at QUIC's negotiated idle timeout.
+
+- `QuicConfig::with_transport_config` — override the quinn `TransportConfig` (flow-control windows,
+  send fairness, congestion control, GSO) on a constructed config, composing with the `from_*`
+  constructors.
+- `ClientQuicConfig::with_transport_config` — the client-side mirror of the above, for tuning the
+  quinn `TransportConfig` on outbound HTTP/3 connections.
+
+## [0.1.6] - 2026-06-18
+
+### Added
+
+- `QuinnTransport` and `QuinnSend` implement `QuicTransportSend::set_priority`, forwarding to
+  quinn's per-stream send priority so HTTP/3 response prioritization takes effect.
+
+## [0.1.5] - 2026-06-16
+
+### Added
+
+- `QuinnEndpoint::connect_with_alpn` (implementing the new `trillium-server-common` seam) — initiate
+  a QUIC connection advertising a per-connection ALPN list, distinct from the endpoint's default, so
+  one endpoint can serve both `h3` and `doq` over a single UDP socket. Available when the
+  `ClientQuicConfig` was built from a rustls config; unavailable on configs built via
+  `from_quinn_client_config`.
+
+## [0.1.4] - 2026-05-31
+
+### Added
+
+- `QuinnConnection`, `QuinnTransport`, `QuinnSend`, `QuinnRecv` — re-exported at the crate root.
+- `QuinnEndpoint::local_addr` — returns the address the underlying `quinn::Endpoint` is bound to.
+
+### Changed
+
+- `QuicConfig::bind_with_socket` is overridden to consume a pre-claimed `std::net::UdpSocket` directly, used by the new `trillium-server-common` `ServerBuilder::bind_quic` path. The existing `QuicConfig::bind(addr, …)` path is unchanged; it now binds the socket and delegates to `bind_with_socket`.
+
+## [0.1.3] - 2026-05-11
+
+### Added
+- `QuicConfig::from_cert_resolver` — build a `QuicConfig` from an `Arc<dyn rustls::server::ResolvesServerCert>`. Lets callers supply a dynamic certificate source (e.g. an ACME integration) without rebuilding the QUIC server config on rotation; if the resolver returns `None`, the TLS handshake fails and the connection is rejected, so binding before the first cert is available is safe.
+
+## [0.1.2] - 2026-05-05
+
+### Fixed
+- Bump `trillium-server-common` dependency specifier to `0.7` to match the 1.1 release; `0.1.1` was published with a stale `0.6` spec.
+
+## [0.1.1] - 2026-05-05 [YANKED]
+
+### Added
+- `pub use quinn` — the underlying `quinn` crate is now re-exported at the crate root, so callers don't need to add `quinn` as a separate dependency to interact with the underlying QUIC types
+
+## [0.1.0] - 2026-05-02
+
+### Added
+- Initial release: Quinn-backed QUIC adapter for HTTP/3 support

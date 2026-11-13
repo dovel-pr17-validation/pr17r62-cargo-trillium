@@ -1,0 +1,43 @@
+[package]
+name = "trillium-server-common"
+version = "0.7.15"
+edition = "2024"
+description = "shared utilities for trillium.rs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/trillium-rs/trillium"
+readme = "README.md"
+keywords = ["trillium", "framework", "async"]
+categories = ["web-programming::http-server", "web-programming"]
+
+[package.metadata.cargo-udeps.ignore]
+development = ["trillium-testing", "trillium-smol"]
+
+[features]
+reuseport = ["dep:socket2"]
+
+[dependencies]
+async-channel = "2.5.0"
+async_cell = "0.2.3"
+atomic-waker = "1.1"
+fieldwork = "0.5.0"
+futures-lite = "2.6.1"
+listenfd = "1.0.2"
+log = "0.4.29"
+pin-project-lite = "0.2.17"
+smallvec = { version = "1.15.1", features = ["const_new"] }
+socket2 = { version = "0.6", features = ["all"], optional = true }
+swansong = "0.3.4"
+trillium = { version = "1.4.1", path = "../trillium" }
+trillium-http = { version = "1.8.0", path = "../http" }
+url = "2.5.8"
+
+[target.'cfg(unix)'.dependencies]
+rlimit = "0.11.0"
+
+[build-dependencies]
+cfg_aliases = "0.2.1"
+
+[dev-dependencies]
+trillium-smol = { path = "../smol" }
+trillium-testing = { path = "../testing" }
+

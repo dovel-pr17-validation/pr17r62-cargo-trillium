@@ -1,0 +1,31 @@
+[package]
+name = "trillium-tera"
+version = "0.5.0"
+edition = "2024"
+description = "tera template handler for trillium.rs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/trillium-rs/trillium"
+readme = "README.md"
+keywords = ["trillium", "framework", "async"]
+categories = ["web-programming::http-server", "web-programming"]
+
+[package.metadata.cargo-udeps.ignore]
+development = ["trillium-testing"]
+
+[features]
+default = ["fast"]
+fast = ["tera/fast"]
+preserve_order = ["tera/preserve_order"]
+unicode = ["tera/unicode"]
+
+[dependencies]
+log = "0.4"
+mime_guess = "2"
+serde = "1"
+tera = { version = "2", default-features = false, features = ["glob_fs"] }
+trillium.workspace = true
+
+[dev-dependencies]
+trillium-smol = { path = "../smol" }
+trillium-testing = { path = "../testing" }
+

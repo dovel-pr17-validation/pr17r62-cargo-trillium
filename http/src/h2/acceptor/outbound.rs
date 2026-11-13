@@ -1,0 +1,140 @@
+//! Outbound bytes plumbing for the driver.
+//!
+//! Two halves:
+//! - [`H2Driver::poll_flush_outbound`] drains `write_buf` to the transport and issues a subsequent
+//!   flush when bytes were written.
+//! - The `queue_*` helpers append encoded frames to `write_buf` and set `write_flush_pending` so
+//!   the next `poll_flush_outbound` issues a flush.
+//!
+//! All methods are on [`super::H2Driver`].
+
+use super::H2Driver;
+use crate::h2::{H2ErrorCode, H2Settings, frame, role::Role, stream_state::StreamEvent};
+use futures_lite::io::{AsyncRead, AsyncWrite};
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll, ready},
+};
+
+impl<T> H2Driver<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    /// Drain `write_buf[write_cursor..]` to the transport, then flush if bytes were
+    /// written. Returns `Ready(Ok(()))` when both the buffer is empty AND any pending
+    /// flush has completed.
+    pub(super) fn poll_flush_outbound(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while self.write_cursor < self.write_buf.len() {
+            let n = ready!(
+                Pin::new(&mut self.transport).poll_write(cx, &self.write_buf[self.write_cursor..])
+            )?;
+            if n == 0 {
+                return Poll::Ready(Err(io::Error::from(io::ErrorKind::WriteZero)));
+            }
+            self.write_cursor += n;
+        }
+        // Fully drained — reset the buffer so future writes start at offset 0.
+        self.write_buf.clear();
+        self.write_cursor = 0;
+        if self.write_flush_pending {
+            ready!(Pin::new(&mut self.transport).poll_flush(cx))?;
+            self.write_flush_pending = false;
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    /// Append one frame to `write_buf`. `max_len` must be an upper bound on the encoded
+    /// size; `encode` writes into the provided slice and returns the actual length (panics
+    /// via `expect` if the caller under-sized `max_len`).
+    pub(super) fn queue_frame(
+        &mut self,
+        max_len: usize,
+        encode: impl FnOnce(&mut [u8]) -> Option<usize>,
+    ) {
+        let start = self.write_buf.len();
+        self.write_buf.resize(start + max_len, 0);
+        let n = encode(&mut self.write_buf[start..]).expect("buffer sized from max_len");
+        self.write_buf.truncate(start + n);
+        self.write_flush_pending = true;
+    }
+
+    pub(super) fn queue_settings(&mut self) {
+        let settings = H2Settings::from_config(self.connection.context().config());
+        log::trace!("h2 emit: SETTINGS {settings:?}");
+        self.queue_frame(frame::settings::encoded_len(&settings), |buf| {
+            frame::settings::encode(&settings, buf)
+        });
+    }
+
+    /// Append the 24-byte client connection preface to `write_buf`. The next outbound
+    /// drain flushes it, and the `NeedsServerSettings` state follows up with our initial
+    /// SETTINGS frame. Client role only.
+    pub(super) fn queue_client_preface(&mut self) {
+        log::trace!("h2 emit: client connection preface (24 bytes)");
+        self.write_buf
+            .extend_from_slice(super::recv::CLIENT_PREFACE);
+        self.write_flush_pending = true;
+    }
+
+    pub(super) fn queue_settings_ack(&mut self) {
+        log::trace!("h2 emit: SETTINGS ACK");
+        self.queue_frame(
+            frame::settings::ACK_ENCODED_LEN,
+            frame::settings::encode_ack,
+        );
+    }
+
+    pub(super) fn queue_ping_ack(&mut self, opaque_data: [u8; 8]) {
+        log::trace!("h2 emit: PING ACK opaque={opaque_data:?}");
+        self.queue_frame(frame::ping::ENCODED_LEN, |buf| {
+            frame::ping::encode(opaque_data, true, buf)
+        });
+    }
+
+    pub(super) fn queue_active_ping(&mut self, opaque_data: [u8; 8]) {
+        log::trace!("h2 emit: PING opaque={opaque_data:?}");
+        self.queue_frame(frame::ping::ENCODED_LEN, |buf| {
+            frame::ping::encode(opaque_data, false, buf)
+        });
+    }
+
+    pub(super) fn queue_window_update(&mut self, stream_id: u32, increment: u32) {
+        log::trace!("h2 emit: WINDOW_UPDATE stream={stream_id} increment={increment}");
+        self.queue_frame(frame::window_update::ENCODED_LEN, |buf| {
+            frame::window_update::encode(stream_id, increment, buf)
+        });
+    }
+
+    pub(super) fn queue_goaway(&mut self, last_stream_id: u32, code: H2ErrorCode) {
+        let last_stream_id = self
+            .goaway_last_stream_id
+            .map_or(last_stream_id, |sent| sent.min(last_stream_id));
+        self.goaway_last_stream_id = Some(last_stream_id);
+        log::trace!("h2 emit: GOAWAY last_stream_id={last_stream_id} code={code:?}");
+        self.queue_frame(frame::goaway::encoded_len(0), |buf| {
+            frame::goaway::encode(last_stream_id, code, &[], buf)
+        });
+    }
+
+    pub(super) fn queue_rst_stream(&mut self, stream_id: u32, code: H2ErrorCode) {
+        // A client stream canceled before its HEADERS were framed never opened, and the peer
+        // treats RST_STREAM on an idle stream as a connection error.
+        if self.role != Role::Client || !self.stream_is_idle(stream_id) {
+            log::trace!("h2 emit: RST_STREAM stream={stream_id} code={code:?}");
+            self.queue_frame(frame::rst_stream::ENCODED_LEN, |buf| {
+                frame::rst_stream::encode(stream_id, code, buf)
+            });
+        }
+        // Frames the peer sent before seeing this reset are then ignored rather than answered.
+        self.closed_streams.record_local_reset(stream_id);
+        // Reflect the reset in the stream's protocol state at the single point we emit an
+        // RST_STREAM, so every reset path (flow-control overflow, late DATA, send error, conn-task
+        // request) leaves the stream terminal. A handler parked on — or about to poll — this stream
+        // then sees recv EOF / send `BrokenPipe` instead of hanging on a stream the driver has
+        // already abandoned. First-wins: a no-op if the stream is gone or already closed.
+        if let Some(entry) = self.streams.get(&stream_id) {
+            let _ = entry.shared.apply_event(StreamEvent::SendReset(code));
+        }
+    }
+}

@@ -1,0 +1,107 @@
+use super::{DroppableFuture, Runtime};
+use futures_lite::Stream;
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
+
+/// A trait that covers async runtime behavior.
+///
+/// You likely do not need to name this type. For a type-erased runtime, see [`Runtime`]
+pub trait RuntimeTrait: Into<Runtime> + Clone + Send + Sync + 'static {
+    /// Spawn a future on the runtime, returning a future that has detach-on-drop semantics
+    ///
+    /// As the various runtimes each has different behavior for spawn, implementations of this trait
+    /// are expected to conform to the following:
+    ///
+    /// * detach on drop: If the returned [`DroppableFuture`] is dropped immediately, the task will
+    ///   continue to execute until completion.
+    ///
+    /// * unwinding: If the spawned future panics, this must not propagate to the join handle.
+    ///   Instead, the awaiting the join handle returns None in case of panic.
+    fn spawn<Fut>(
+        &self,
+        fut: Fut,
+    ) -> DroppableFuture<impl Future<Output = Option<Fut::Output>> + Send + 'static>
+    where
+        Fut: Future + Send + 'static,
+        Fut::Output: Send + 'static;
+
+    /// Spawn a future on the runtime without a join handle.
+    ///
+    /// The output type is `()` because no completion signal or output is available to the
+    /// caller. If the spawned future panics, the panic does not propagate to the spawning
+    /// task; whether it is logged or swallowed is runtime-specific.
+    ///
+    /// The default implementation spawns and immediately drops the join handle, relying on
+    /// the detach-on-drop contract of [`spawn`][Self::spawn].
+    fn spawn_detached<Fut>(&self, fut: Fut)
+    where
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        drop(self.spawn(fut));
+    }
+
+    /// Wake in this amount of wall time
+    fn delay(&self, duration: Duration) -> impl Future<Output = ()> + Send;
+
+    /// Returns a [`Stream`] that yields a `()` on the provided period
+    fn interval(&self, period: Duration) -> impl Stream<Item = ()> + Send + 'static;
+
+    /// Runtime implementation hook for blocking on a top level future.
+    fn block_on<Fut>(&self, fut: Fut) -> Fut::Output
+    where
+        Fut: Future;
+
+    /// Race a future against the provided duration, returning None in case of timeout.
+    fn timeout<'runtime, 'fut, Fut>(
+        &'runtime self,
+        duration: Duration,
+        fut: Fut,
+    ) -> impl Future<Output = Option<Fut::Output>> + Send + 'fut
+    where
+        Fut: Future + Send + 'fut,
+        Fut::Output: Send + 'static,
+        'runtime: 'fut,
+    {
+        Timeout {
+            fut,
+            delay: self.delay(duration),
+        }
+    }
+
+    /// trap and return a [`Stream`] of signals that match the provided signals
+    fn hook_signals(
+        &self,
+        signals: impl IntoIterator<Item = i32>,
+    ) -> impl Stream<Item = i32> + Send + 'static {
+        let _ = signals;
+        futures_lite::stream::empty()
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// A hand-written combinator rather than racing `async` blocks because a generator that
+    /// captures `fut` and awaits it stores the future twice (capture slot + await slot),
+    /// doubling the caller's storage for the timed-out future.
+    struct Timeout<Fut, Delay> {
+        #[pin]
+        fut: Fut,
+        #[pin]
+        delay: Delay,
+    }
+}
+
+impl<Fut: Future, Delay: Future<Output = ()>> Future for Timeout<Fut, Delay> {
+    type Output = Option<Fut::Output>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        if let Poll::Ready(output) = this.fut.poll(cx) {
+            return Poll::Ready(Some(output));
+        }
+        this.delay.poll(cx).map(|()| None)
+    }
+}

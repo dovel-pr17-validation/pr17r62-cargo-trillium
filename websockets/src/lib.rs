@@ -1,0 +1,529 @@
+#![forbid(unsafe_code)]
+#![deny(
+    clippy::dbg_macro,
+    missing_copy_implementations,
+    rustdoc::missing_crate_level_docs,
+    missing_debug_implementations,
+    missing_docs,
+    nonstandard_style,
+    unused_qualifications
+)]
+
+//! # A websocket trillium handler
+//!
+//! There are three primary ways to use this crate
+//!
+//! ## With an async function that receives a [`WebSocketConn`]
+//!
+//! This is the simplest way to use trillium websockets, but does not
+//! provide any of the affordances that implementing the
+//! [`WebSocketHandler`] trait does. It is best for very simple websockets
+//! or for usages that require moving the WebSocketConn elsewhere in an
+//! application. The WebSocketConn is fully owned at this point, and will
+//! disconnect when dropped, not when the async function passed to
+//! `websocket` completes.
+//!
+//! ```
+//! use futures_lite::stream::StreamExt;
+//! use trillium_websockets::{Message, WebSocketConn, websocket};
+//!
+//! let handler = websocket(|mut conn: WebSocketConn| async move {
+//!     while let Some(Ok(Message::Text(input))) = conn.next().await {
+//!         conn.send_string(format!("received your message: {}", &input))
+//!             .await;
+//!     }
+//! });
+//! # // tests at tests/tests.rs for example simplicity
+//! ```
+//!
+//!
+//! ## Implementing [`WebSocketHandler`]
+//!
+//! [`WebSocketHandler`] provides support for sending outbound messages as a
+//! stream, and simplifies common patterns like executing async code on
+//! received messages.
+//!
+//! ## Using [`JsonWebSocketHandler`]
+//!
+//! [`JsonWebSocketHandler`] provides a thin serialization and
+//! deserialization layer on top of [`WebSocketHandler`] for this common
+//! use case.  See the [`JsonWebSocketHandler`] documentation for example
+//! usage. In order to use this trait, the `json` cargo feature must be
+//! enabled.
+//!
+//! ## Origin checking
+//!
+//! Browsers do not apply CORS to websocket handshakes, so a page on any site can open a socket to
+//! any server, and the browser attaches the visitor's cookies to that handshake. RFC 6455 §10.2
+//! assigns the origin check to the server for exactly this reason; skipping it is the
+//! cross-site websocket hijacking vulnerability.
+//!
+//! By default this handler accepts a handshake only if its `Origin` names the same host as the
+//! request's `Host` or `:authority`, or if there is no `Origin` at all, which means the client is
+//! not a browser. Rejected handshakes receive a `403 Forbidden` and log which origin was refused.
+//!
+//! ```
+//! # use trillium_websockets::{WebSocket, WebSocketConn};
+//! # let handler = |_: WebSocketConn| async {};
+//! WebSocket::new(handler); // same-origin (default)
+//! //
+//! # let handler = |_: WebSocketConn| async {};
+//! WebSocket::new(handler).allow_origins(["https://app.example.com"]);
+//! # let handler = |_: WebSocketConn| async {};
+//! WebSocket::new(handler).allow_origin_fn(|origin| origin == Some("https://app.example.com"));
+//! # let handler = |_: WebSocketConn| async {};
+//! WebSocket::new(handler).allow_any_origin(); // opt out
+//! ```
+//!
+//! An application that serves its pages from one host and its sockets from another — say pages on
+//! `app.example.com` and sockets on `api.example.com` — must name the page origin with
+//! [`allow_origins`][WebSocket::allow_origins].
+//!
+//! ## Message size
+//!
+//! Inbound messages are assembled in memory before they reach a handler, up to tungstenite's
+//! default of 64 MiB per message. Applications that exchange small messages should lower that
+//! with [`with_protocol_config`][WebSocket::with_protocol_config].
+
+#[cfg(test)]
+#[doc = include_str!("../README.md")]
+mod readme {}
+
+mod direction;
+mod driver;
+mod origin;
+mod websocket_connection;
+mod websocket_handler;
+
+// Retained only so that code naming `trillium_websockets::async_tungstenite` keeps building;
+// remove it, and the async-tungstenite dependency, at the next breaking release.
+pub use async_tungstenite;
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use direction::{Direction, poll_next_direction};
+use origin::{OriginPolicy, OriginPredicate};
+use sha1::{Digest, Sha1};
+use std::{
+    net::IpAddr,
+    ops::{Deref, DerefMut},
+};
+use trillium::{
+    Conn, Handler, Info, KnownHeaderName,
+    KnownHeaderName::{
+        Connection, SecWebsocketAccept, SecWebsocketKey, SecWebsocketProtocol, SecWebsocketVersion,
+        Upgrade as UpgradeHeader,
+    },
+    Method, Status, Upgrade, Version,
+};
+pub use tungstenite::{
+    self, Message,
+    protocol::{Role, WebSocketConfig},
+};
+pub use websocket_connection::WebSocketConn;
+pub use websocket_handler::WebSocketHandler;
+
+const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+#[derive(thiserror::Error, Debug)]
+#[non_exhaustive]
+/// An Error type that represents all exceptional conditions that can be encoutered in the operation
+/// of this crate
+pub enum Error {
+    #[error(transparent)]
+    /// an error in the underlying websocket implementation
+    WebSocket(#[from] tungstenite::Error),
+
+    #[cfg(feature = "json")]
+    #[error(transparent)]
+    /// an error in json serialization or deserialization
+    Json(#[from] serde_json::Error),
+}
+
+/// a Result type for this crate
+pub type Result<T = Message> = std::result::Result<T, Error>;
+
+#[cfg(feature = "json")]
+mod json;
+
+#[cfg(feature = "json")]
+pub use json::{JsonHandler, JsonWebSocketHandler, json_websocket};
+
+/// The trillium handler.
+/// See crate-level docs for example usage.
+#[derive(Debug)]
+pub struct WebSocket<H> {
+    handler: H,
+    protocols: Vec<String>,
+    config: Option<WebSocketConfig>,
+    required: bool,
+    origin_policy: OriginPolicy,
+}
+
+impl<H> Deref for WebSocket<H> {
+    type Target = H;
+
+    fn deref(&self) -> &Self::Target {
+        &self.handler
+    }
+}
+
+impl<H> DerefMut for WebSocket<H> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.handler
+    }
+}
+
+/// Builds a new trillium handler from the provided
+/// WebSocketHandler. Alias for [`WebSocket::new`]
+pub fn websocket<H>(websocket_handler: H) -> WebSocket<H>
+where
+    H: WebSocketHandler,
+{
+    WebSocket::new(websocket_handler)
+}
+
+impl<H> WebSocket<H>
+where
+    H: WebSocketHandler,
+{
+    async fn run_h1(&self, mut conn: Conn) -> Conn {
+        if !upgrade_requested(&conn) {
+            if self.required {
+                return conn.with_status(Status::UpgradeRequired).halt();
+            } else {
+                return conn;
+            }
+        }
+
+        if !self.origin_policy.allows(&conn) {
+            return reject_origin(conn);
+        }
+
+        if !supported_websocket_version(&conn) {
+            return reject_unsupported_version(conn);
+        }
+
+        let websocket_peer_ip = WebsocketPeerIp(conn.peer_ip());
+
+        let Some(sec_websocket_key) = conn.request_headers().get_str(SecWebsocketKey) else {
+            return conn.with_status(Status::BadRequest).halt();
+        };
+        let sec_websocket_accept = websocket_accept_hash(sec_websocket_key);
+
+        let protocol = websocket_protocol(&conn, &self.protocols);
+
+        let headers = conn.response_headers_mut();
+
+        headers.extend([
+            (UpgradeHeader, "websocket"),
+            (Connection, "Upgrade"),
+            (SecWebsocketVersion, "13"),
+        ]);
+
+        headers.insert(SecWebsocketAccept, sec_websocket_accept);
+
+        if let Some(protocol) = protocol {
+            headers.insert(SecWebsocketProtocol, protocol);
+        }
+
+        conn.halt()
+            .with_state(websocket_peer_ip)
+            .with_state(IsWebsocket)
+            .with_status(Status::SwitchingProtocols)
+    }
+
+    /// Build a new WebSocket with an async handler function that
+    /// receives a [`WebSocketConn`]
+    pub fn new(handler: H) -> Self {
+        Self {
+            handler,
+            protocols: Default::default(),
+            config: None,
+            required: false,
+            origin_policy: OriginPolicy::default(),
+        }
+    }
+
+    /// Accept handshakes only from pages on these origins.
+    ///
+    /// ```
+    /// # use trillium_websockets::{WebSocket, WebSocketConn};
+    /// # let websocket = WebSocket::new(|_: WebSocketConn| async {});
+    /// websocket.allow_origins(["https://app.example.com", "https://admin.example.com"]);
+    /// ```
+    ///
+    /// Origins are compared exactly, after normalizing default ports and idn hosts. Nothing is
+    /// matched by prefix or suffix, because an allowed origin of `example.com` matched by suffix
+    /// also admits `evil-example.com`. For a family of subdomains, use
+    /// [`allow_origin_fn`][Self::allow_origin_fn].
+    ///
+    /// A request with no `Origin` header is allowed, as it did not come from a browser.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any of the provided strings is not a url with a scheme and a host, or if it
+    /// carries a path, query, fragment, or userinfo.
+    pub fn allow_origins<'a>(mut self, origins: impl IntoIterator<Item = &'a str>) -> Self {
+        self.origin_policy = OriginPolicy::list(origins);
+        self
+    }
+
+    /// Accept handshakes for which this predicate returns true.
+    ///
+    /// The argument is the raw `Origin` header, so `None` (a non-browser client) stays
+    /// distinguishable from `Some("null")` (a sandboxed iframe or a `file://` page, which is
+    /// attacker-reachable and should generally be rejected).
+    ///
+    /// ```
+    /// # use trillium_websockets::{WebSocket, WebSocketConn};
+    /// # let websocket = WebSocket::new(|_: WebSocketConn| async {});
+    /// websocket.allow_origin_fn(|origin| match origin {
+    ///     None => true,
+    ///     Some(origin) => origin
+    ///         .strip_prefix("https://")
+    ///         .is_some_and(|host| host == "example.com" || host.ends_with(".example.com")),
+    /// });
+    /// ```
+    pub fn allow_origin_fn<F>(mut self, predicate: F) -> Self
+    where
+        F: Fn(Option<&str>) -> bool + Send + Sync + 'static,
+    {
+        self.origin_policy = OriginPolicy::Predicate(OriginPredicate::from(predicate));
+        self
+    }
+
+    /// Accept handshakes from any origin, disabling the same-origin default.
+    ///
+    /// Any page on the web can then open a socket to this handler and act with the browser's
+    /// ambient authority — the visitor's cookies are attached to the handshake. Only do this if
+    /// the socket is either unauthenticated or authenticated by something the page cannot
+    /// replay, such as a token the client sends in its first message.
+    pub fn allow_any_origin(mut self) -> Self {
+        self.origin_policy = OriginPolicy::Any;
+        self
+    }
+
+    /// `protocols` is a sequence of known protocols. On successful handshake,
+    /// the returned response headers contain the first protocol in this list
+    /// which the server also knows.
+    pub fn with_protocols(self, protocols: &[&str]) -> Self {
+        Self {
+            protocols: protocols.iter().map(ToString::to_string).collect(),
+            ..self
+        }
+    }
+
+    /// configure the websocket protocol
+    ///
+    /// `read_buffer_size` is the most that is read from the socket at once, allocated once per
+    /// connection. Without a config it is 8 KiB; [`WebSocketConfig::default`] carries
+    /// tungstenite's 128 KiB, so set it explicitly when starting from the default.
+    /// `write_buffer_size` is how much fed output can accumulate before
+    /// [`WebSocketConn::feed`] waits for it to be written.
+    pub fn with_protocol_config(self, config: WebSocketConfig) -> Self {
+        Self {
+            config: Some(config),
+            ..self
+        }
+    }
+
+    /// configure this handler to halt and send back a [`426 Upgrade
+    /// Required`][Status::UpgradeRequired] if a websocket cannot be negotiated
+    pub fn required(mut self) -> Self {
+        self.required = true;
+        self
+    }
+}
+
+struct IsWebsocket;
+
+#[cfg(test)]
+mod tests;
+
+// this is a workaround for the fact that Upgrade is a public struct,
+// so adding peer_ip to that struct would be a breaking change. We
+// stash a copy in state for now.
+struct WebsocketPeerIp(Option<IpAddr>);
+
+impl<H> Handler for WebSocket<H>
+where
+    H: WebSocketHandler,
+{
+    async fn run(&self, mut conn: Conn) -> Conn {
+        match conn.http_version() {
+            Version::Http1_0 | Version::Http1_1 => self.run_h1(conn).await,
+            // Extended-CONNECT bootstrap of WebSockets — RFC 8441 (h2) and RFC 9220 (h3) define
+            // the same shape: `:method = CONNECT`, `:protocol = websocket`, no SHA1/Key/Accept
+            // handshake. The server replies with status 200 and the stream stays open as a
+            // bidirectional byte channel carrying WebSocket frames.
+            Version::Http2 | Version::Http3 => {
+                if extended_connect_websocket_request(&conn) {
+                    if !self.origin_policy.allows(&conn) {
+                        return reject_origin(conn);
+                    }
+
+                    if !supported_websocket_version(&conn) {
+                        return reject_unsupported_version(conn);
+                    }
+
+                    let websocket_peer_ip = WebsocketPeerIp(conn.peer_ip());
+                    let protocol = websocket_protocol(&conn, &self.protocols);
+
+                    if let Some(protocol) = protocol {
+                        conn.response_headers_mut()
+                            .insert(SecWebsocketProtocol, protocol);
+                    }
+
+                    conn.halt()
+                        .with_state(websocket_peer_ip)
+                        .with_state(IsWebsocket)
+                        .with_status(Status::Ok)
+                } else if self.required {
+                    conn.with_status(Status::UpgradeRequired).halt()
+                } else {
+                    conn
+                }
+            }
+            _ => {
+                if self.required {
+                    conn.with_status(Status::UpgradeRequired).halt()
+                } else {
+                    conn
+                }
+            }
+        }
+    }
+
+    async fn init(&mut self, info: &mut Info) {
+        // Required for h2 (RFC 8441 §3) and h3 (RFC 9220 §3) clients to attempt the extended
+        // CONNECT bootstrap of WebSockets. Harmless on h1.
+        info.config_mut().set_extended_connect_enabled(true);
+    }
+
+    fn has_upgrade(&self, upgrade: &Upgrade) -> bool {
+        upgrade.state().contains::<IsWebsocket>()
+    }
+
+    async fn upgrade(&self, mut upgrade: Upgrade) {
+        let peer_ip = upgrade
+            .state_mut()
+            .take::<WebsocketPeerIp>()
+            .and_then(|i| i.0);
+        let mut conn = WebSocketConn::new(upgrade, self.config, Role::Server).await;
+        conn.set_peer_ip(peer_ip);
+
+        let Some((mut conn, outbound)) = self.handler.connect(conn).await else {
+            return;
+        };
+
+        let mut outbound = std::pin::pin!(outbound);
+        loop {
+            let next = futures_lite::future::poll_fn(|cx| {
+                poll_next_direction(&mut conn, outbound.as_mut(), cx)
+            })
+            .await;
+
+            let Some(message) = next else { break };
+            match message {
+                Direction::Inbound(Ok(Message::Close(close_frame))) => {
+                    self.handler.disconnect(&mut conn, close_frame).await;
+                    break;
+                }
+
+                Direction::Inbound(Ok(message)) => {
+                    self.handler.inbound(message, &mut conn).await;
+                }
+
+                Direction::Outbound(message) => {
+                    if let Err(e) = self.handler.send(message, &mut conn).await {
+                        log::warn!("outbound websocket error: {:?}", e);
+                        break;
+                    }
+                }
+
+                _ => {
+                    self.handler.disconnect(&mut conn, None).await;
+                    break;
+                }
+            }
+        }
+
+        if let Some(err) = conn.close().await.err() {
+            log::warn!("websocket close error: {:?}", err);
+        };
+    }
+}
+
+fn websocket_protocol(conn: &Conn, protocols: &[String]) -> Option<String> {
+    conn.request_headers()
+        .token_iter(SecWebsocketProtocol)
+        .find(|req_p| protocols.iter().any(|x| x == req_p))
+        .map(str::to_owned)
+}
+
+fn connection_is_upgrade(conn: &Conn) -> bool {
+    conn.request_headers()
+        .token_iter(Connection)
+        .any(|c| c.eq_ignore_ascii_case("upgrade"))
+}
+
+fn upgrade_to_websocket(conn: &Conn) -> bool {
+    conn.request_headers()
+        .eq_ignore_ascii_case(UpgradeHeader, "websocket")
+}
+
+fn supported_websocket_version(conn: &Conn) -> bool {
+    conn.request_headers().get_str(SecWebsocketVersion) == Some("13")
+}
+
+fn reject_origin(conn: Conn) -> Conn {
+    log::warn!(
+        "rejecting websocket handshake from origin {:?} for authority {:?}. If this is expected, \
+         configure the origins that may open a websocket with `WebSocket::allow_origins([..])`, \
+         `WebSocket::allow_origin_fn(..)`, or `WebSocket::allow_any_origin()`.",
+        conn.request_headers().get_str(KnownHeaderName::Origin),
+        conn.host()
+    );
+
+    conn.with_status(Status::Forbidden).halt()
+}
+
+fn reject_unsupported_version(conn: Conn) -> Conn {
+    conn.with_status(Status::UpgradeRequired)
+        .with_response_header(SecWebsocketVersion, "13")
+        .halt()
+}
+
+fn upgrade_requested(conn: &Conn) -> bool {
+    conn.method() == Method::Get
+        && conn.http_version() == Version::Http1_1
+        && connection_is_upgrade(conn)
+        && upgrade_to_websocket(conn)
+}
+
+/// Detect a WebSocket bootstrap over extended CONNECT (RFC 8441 for h2, RFC 9220 for h3).
+///
+/// The peer must use `CONNECT` and carry a `:protocol` pseudo-header equal to "websocket"
+/// (case-insensitive per the RFCs).
+fn extended_connect_websocket_request(conn: &Conn) -> bool {
+    if conn.method() != Method::Connect {
+        return false;
+    }
+    let inner: &trillium_http::Conn<Box<dyn trillium::Transport>> = conn.as_ref();
+    inner
+        .protocol()
+        .is_some_and(|p| p.eq_ignore_ascii_case("websocket"))
+}
+
+/// Generate a random key suitable for Sec-WebSocket-Key
+pub fn websocket_key() -> String {
+    BASE64.encode(fastrand::u128(..).to_ne_bytes())
+}
+
+/// Generate the expected Sec-WebSocket-Accept hash from the Sec-WebSocket-Key
+pub fn websocket_accept_hash(websocket_key: &str) -> String {
+    let hash = Sha1::new()
+        .chain_update(websocket_key)
+        .chain_update(WEBSOCKET_GUID)
+        .finalize();
+    BASE64.encode(&hash[..])
+}

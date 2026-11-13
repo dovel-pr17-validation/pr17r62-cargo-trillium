@@ -1,0 +1,76 @@
+use crate::bytes;
+use full_duplex_async_copy::full_duplex_copy;
+use std::fmt::Debug;
+use trillium::{Conn, Handler, Method, Status, Transport, Upgrade};
+use trillium_client::{ArcedConnector, Connector};
+use url::Url;
+
+#[derive(Debug)]
+/// trillium handler to implement Connect proxying
+pub struct ForwardProxyConnect(ArcedConnector);
+
+struct ForwardUpgrade(Box<dyn Transport>);
+
+impl Debug for ForwardUpgrade {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ForwardUpgrade").finish_non_exhaustive()
+    }
+}
+
+impl ForwardProxyConnect {
+    /// construct a new ForwardProxyConnect
+    pub fn new(connector: impl Connector) -> Self {
+        Self(ArcedConnector::new(connector))
+    }
+}
+
+impl Handler for ForwardProxyConnect {
+    async fn run(&self, conn: Conn) -> Conn {
+        if conn.method() == Method::Connect {
+            let authority = {
+                let conn: &trillium_http::Conn<Box<dyn Transport>> = conn.as_ref();
+                conn.authority()
+            };
+
+            let Some(authority) = authority else {
+                return conn.with_status(Status::BadRequest).halt();
+            };
+
+            let Ok(url) = Url::parse(&format!("http://{}", authority)) else {
+                return conn.with_status(Status::BadRequest).halt();
+            };
+
+            if url.cannot_be_a_base() {
+                return conn.with_status(Status::BadRequest).halt();
+            }
+
+            let Ok(tcp) = Connector::connect(&self.0, &url).await else {
+                return conn.with_status(Status::BadGateway).halt();
+            };
+
+            conn.with_status(Status::Ok)
+                .with_state(ForwardUpgrade(tcp))
+                .halt()
+        } else {
+            conn
+        }
+    }
+
+    fn has_upgrade(&self, upgrade: &Upgrade) -> bool {
+        upgrade.state().contains::<ForwardUpgrade>()
+    }
+
+    async fn upgrade(&self, mut upgrade: Upgrade) {
+        let Some(ForwardUpgrade(upstream)) = upgrade.state_mut().take() else {
+            return;
+        };
+
+        let downstream = upgrade;
+        match full_duplex_copy(upstream, downstream).await {
+            Err(e) => log::error!("upgrade stream error: {:?}", e),
+            Ok((up, down)) => {
+                log::debug!("streamed upgrade {} up and {} down", bytes(up), bytes(down))
+            }
+        }
+    }
+}

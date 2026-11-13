@@ -1,0 +1,44 @@
+[package]
+name = "trillium-tokio"
+version = "0.6.4"
+authors = ["Jacob Rothstein <hi@jbr.me>"]
+edition = "2024"
+description = "tokio runtime adapter for trillium.rs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/trillium-rs/trillium"
+readme = "README.md"
+keywords = ["trillium", "framework", "async"]
+categories = ["web-programming::http-server", "web-programming"]
+
+[features]
+# SO_REUSEPORT thread-per-core fan-out entrypoint (Unix only). Enables the `FanOut` impl for
+# `TokioRuntime` and forwards to server-common's `reuseport` feature, which exposes
+# `ListenerConfig::bind_reuseport_*` and pulls in socket2.
+reuseport = ["trillium-server-common/reuseport"]
+
+[dependencies]
+async-compat = "0.2.5"
+log = "0.4.29"
+tokio-stream = { version = "0.1.18", features = ["net"] }
+trillium.workspace = true
+trillium-http.workspace = true
+trillium-macros.workspace = true
+trillium-server-common = { version = "0.7.5", path = "../server-common" }
+
+[dependencies.tokio]
+version = "1.50.0"
+features = ["rt", "net", "fs", "rt-multi-thread", "time"]
+
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.4.3"
+signal-hook-tokio = { version = "0.4.0", features = ["futures-v0_3"] }
+
+[dev-dependencies]
+env_logger = "0.11.10"
+tempfile = "3.27.0"
+tokio = { version = "1.50.0", features = ["full"] }
+trillium-client = { path = "../client" }
+
+[[example]]
+name = "reuseport"
+required-features = ["reuseport"]

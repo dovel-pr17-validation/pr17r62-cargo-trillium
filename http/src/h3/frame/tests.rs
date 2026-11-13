@@ -1,0 +1,449 @@
+use super::*;
+use crate::Priority;
+
+// -- FrameHeader tests --
+
+/// Build wire bytes for a frame header from a raw type value and length.
+fn encode_raw_header(frame_type: impl Into<u64>, payload_length: u64) -> Vec<u8> {
+    let mut buf = vec![0; 256];
+    let mut written = 0;
+    written += quic_varint::encode(frame_type, &mut buf[written..]).unwrap();
+    written += quic_varint::encode(payload_length, &mut buf[written..]).unwrap();
+    buf.truncate(written);
+    buf
+}
+
+#[test]
+fn header_roundtrip_all_known_types() {
+    for ft in [
+        FrameType::Data,
+        FrameType::Headers,
+        FrameType::CancelPush,
+        FrameType::Settings,
+        FrameType::PushPromise,
+        FrameType::Goaway,
+        FrameType::MaxPushId,
+    ] {
+        let header = FrameHeader {
+            frame_type: Some(ft),
+            payload_length: 42,
+        };
+        let mut buf = vec![0; 256];
+
+        let written = header.encode(&mut buf).unwrap();
+        let (decoded, consumed) = FrameHeader::decode(&buf[..written]).unwrap();
+        assert_eq!(decoded, header, "roundtrip failed for {ft:?}");
+        assert_eq!(consumed, written);
+    }
+}
+
+#[test]
+fn header_unknown_frame_type() {
+    let buf = encode_raw_header(0xFFu64, 100);
+    let (header, consumed) = FrameHeader::decode(&buf).unwrap();
+    assert_eq!(header.frame_type, None);
+    assert_eq!(header.payload_length, 100);
+    assert_eq!(consumed, buf.len());
+}
+
+#[test]
+fn header_incomplete() {
+    assert_eq!(FrameHeader::decode(&[]), Err(FrameDecodeError::Incomplete));
+    // Type present but length missing
+    let mut buf = vec![0; 256];
+    let written = quic_varint::encode(FrameType::Headers, &mut buf).unwrap();
+    assert_eq!(
+        FrameHeader::decode(&buf[..written]),
+        Err(FrameDecodeError::Incomplete)
+    );
+}
+
+// -- Frame tests --
+
+/// Build a complete wire frame from a raw type value and payload bytes.
+fn encode_raw_frame(frame_type: impl Into<u64>, payload: &[u8]) -> Vec<u8> {
+    let mut buf = vec![0; 256];
+    let mut written = 0;
+
+    written += quic_varint::encode(frame_type, &mut buf[written..]).unwrap();
+    written += quic_varint::encode(payload.len() as u64, &mut buf[written..]).unwrap();
+    buf.truncate(written);
+    buf.extend_from_slice(payload);
+    buf
+}
+
+#[test]
+fn frame_data() {
+    let header = encode_raw_header(FrameType::Data, 42);
+    let header_len = header.len();
+    let mut buf = header;
+    buf.extend_from_slice(&[0xAA; 50]); // payload + trailing
+    let (frame, consumed) = Frame::decode(&buf).unwrap();
+    assert_eq!(frame, Frame::Data(42));
+    assert_eq!(consumed, header_len); // payload not consumed
+}
+
+#[test]
+fn frame_headers() {
+    let buf = encode_raw_header(FrameType::Headers, 10);
+    let (frame, consumed) = Frame::decode(&buf).unwrap();
+    assert_eq!(frame, Frame::Headers(10));
+    assert_eq!(consumed, buf.len());
+}
+
+#[test]
+fn frame_unknown() {
+    let buf = encode_raw_header(0xFFu64, 200);
+    let (frame, consumed) = Frame::decode(&buf).unwrap();
+    assert_eq!(frame, Frame::Unknown(200));
+    assert_eq!(consumed, buf.len());
+}
+
+#[test]
+fn frame_goaway() {
+    let mut payload = vec![0; 256];
+    let payload_len = quic_varint::encode(12u64, &mut payload).unwrap();
+    let buf = encode_raw_frame(FrameType::Goaway, &payload[..payload_len]);
+    let (frame, consumed) = Frame::decode(&buf).unwrap();
+    assert_eq!(frame, Frame::Goaway(12));
+    assert_eq!(consumed, buf.len());
+}
+
+#[test]
+fn frame_cancel_push() {
+    let mut payload = vec![0; 256];
+    let payload_len = quic_varint::encode(7u64, &mut payload).unwrap();
+    let buf = encode_raw_frame(FrameType::CancelPush, &payload[..payload_len]);
+    let (frame, consumed) = Frame::decode(&buf).unwrap();
+    assert_eq!(frame, Frame::CancelPush(7));
+    assert_eq!(consumed, buf.len());
+}
+
+#[test]
+fn frame_max_push_id() {
+    let mut payload = vec![0; 256];
+    let payload_len = quic_varint::encode(99u64, &mut payload).unwrap();
+    let buf = encode_raw_frame(FrameType::MaxPushId, &payload[..payload_len]);
+    let (frame, consumed) = Frame::decode(&buf).unwrap();
+    assert_eq!(frame, Frame::MaxPushId(99));
+    assert_eq!(consumed, buf.len());
+}
+
+#[test]
+fn frame_settings_roundtrip() {
+    let settings = H3Settings::new().with_max_field_section_size(8192);
+    let mut payload = vec![0; 256];
+    let payload_len = settings.encode(&mut payload).unwrap();
+    let buf = encode_raw_frame(FrameType::Settings, &payload[..payload_len]);
+    let (frame, consumed) = Frame::decode(&buf).unwrap();
+    assert_eq!(frame, Frame::Settings(settings));
+    assert_eq!(consumed, buf.len());
+}
+
+#[test]
+fn frame_goaway_trailing_bytes_is_error() {
+    // Goaway payload should be exactly one varint. Add an extra byte.
+    let mut payload = Vec::new();
+    quic_varint::encode(5u64, &mut payload);
+    payload.push(0xFF); // trailing garbage
+    let buf = encode_raw_frame(FrameType::Goaway, &payload);
+    assert_eq!(
+        Frame::decode(&buf),
+        Err(FrameDecodeError::Error(H3ErrorCode::FrameError))
+    );
+}
+
+// Regression: control streams deliver consecutive frames coalesced into one read buffer,
+// so a well-formed single-varint frame followed by the next frame's bytes must decode
+// cleanly rather than misreading the trailing bytes as a length violation.
+#[test]
+fn frame_single_varint_frames_decode_with_following_frames_buffered() {
+    for frame_type in [
+        FrameType::Goaway,
+        FrameType::CancelPush,
+        FrameType::MaxPushId,
+    ] {
+        let mut settings_payload = vec![0; 16];
+        let settings_len = H3Settings::new()
+            .with_max_field_section_size(8192)
+            .encode(&mut settings_payload)
+            .unwrap();
+
+        let mut buf = encode_raw_frame(frame_type, &[0x0C]);
+        buf.extend_from_slice(&encode_raw_frame(
+            FrameType::Settings,
+            &settings_payload[..settings_len],
+        ));
+
+        let expected_frame = match frame_type {
+            FrameType::Goaway => Frame::Goaway(12),
+            FrameType::CancelPush => Frame::CancelPush(12),
+            FrameType::MaxPushId => Frame::MaxPushId(12),
+            other => panic!("unexpected frame type {other:?}"),
+        };
+
+        let (frame, consumed) = Frame::decode(&buf).unwrap();
+        assert_eq!(frame, expected_frame, "{frame_type:?}");
+        assert_eq!(consumed, 3, "{frame_type:?}");
+
+        // the remainder decodes as the next frame
+        let (next, _) = Frame::decode(&buf[consumed..]).unwrap();
+        assert!(matches!(next, Frame::Settings(_)), "{frame_type:?}");
+    }
+}
+
+#[test]
+fn frame_push_promise() {
+    // PushPromise payload: varint(push_id) + field section bytes
+    let mut payload = vec![0; 256];
+    let push_id_len = quic_varint::encode(3u64, &mut payload).unwrap(); // push_id = 3
+    payload.truncate(push_id_len);
+    payload.extend_from_slice(b"fake qpack field section");
+    let field_section_length = payload.len() - push_id_len;
+
+    let mut buf = encode_raw_frame(FrameType::PushPromise, &payload);
+    buf.extend_from_slice(b"trailing");
+    let (frame, consumed) = Frame::decode(&buf).unwrap();
+    assert_eq!(
+        frame,
+        Frame::PushPromise {
+            push_id: 3,
+            field_section_length: field_section_length as u64,
+        }
+    );
+    // consumed includes frame header + push_id varint; field section + trailing remain
+    let rest = &buf[consumed..];
+    assert!(rest.starts_with(b"fake qpack field section"));
+    assert!(rest.ends_with(b"trailing"));
+}
+
+#[test]
+fn frame_push_promise_incomplete() {
+    // Frame header present but push_id varint not available
+    let buf = encode_raw_header(FrameType::PushPromise, 100);
+    // no payload bytes at all
+    assert_eq!(Frame::decode(&buf), Err(FrameDecodeError::Incomplete));
+}
+
+#[test]
+fn frame_incomplete_control() {
+    // Settings frame header present but payload not fully available
+    let mut buf = encode_raw_header(FrameType::Settings, 20);
+    buf.extend_from_slice(&[0; 5]); // only 5 of 20 payload bytes
+    assert_eq!(Frame::decode(&buf), Err(FrameDecodeError::Incomplete));
+}
+
+#[test]
+fn frame_incomplete_empty() {
+    assert_eq!(Frame::decode(&[]), Err(FrameDecodeError::Incomplete));
+}
+
+fn priority_update_payload(element_id: u64, field_value: &[u8]) -> Vec<u8> {
+    let mut payload = vec![0; 16];
+    let n = quic_varint::encode(element_id, &mut payload).unwrap();
+    payload.truncate(n);
+    payload.extend_from_slice(field_value);
+    payload
+}
+
+#[test]
+fn frame_priority_update() {
+    let buf = encode_raw_frame(
+        FrameType::PriorityUpdate,
+        &priority_update_payload(4, b"u=1, i"),
+    );
+    let (frame, consumed) = Frame::decode(&buf).unwrap();
+    assert_eq!(
+        frame,
+        Frame::PriorityUpdate {
+            prioritized_element_id: 4,
+            priority: Priority::new(1).with_incremental(true),
+        }
+    );
+    assert_eq!(consumed, buf.len());
+}
+
+#[test]
+fn frame_priority_update_empty_field_is_default() {
+    let buf = encode_raw_frame(FrameType::PriorityUpdate, &priority_update_payload(0, b""));
+    let (frame, _) = Frame::decode(&buf).unwrap();
+    assert_eq!(
+        frame,
+        Frame::PriorityUpdate {
+            prioritized_element_id: 0,
+            priority: Priority::default(),
+        }
+    );
+}
+
+// -- Frame encode tests --
+
+#[test]
+fn encode_decode_roundtrip_data() {
+    let frame = Frame::Data(1024);
+    let mut buf = [0u8; 16];
+    let n = frame.encode(&mut buf).unwrap();
+    assert_eq!(n, frame.encoded_len());
+    let (decoded, consumed) = Frame::decode(&buf[..n]).unwrap();
+    assert_eq!(decoded, frame);
+    assert_eq!(consumed, n);
+}
+
+#[test]
+fn encode_decode_roundtrip_goaway() {
+    let frame = Frame::Goaway(42);
+    let mut buf = [0u8; 16];
+    let n = frame.encode(&mut buf).unwrap();
+    assert_eq!(n, frame.encoded_len());
+    let (decoded, consumed) = Frame::decode(&buf[..n]).unwrap();
+    assert_eq!(decoded, frame);
+    assert_eq!(consumed, n);
+}
+
+#[test]
+fn encode_decode_roundtrip_settings() {
+    let settings = H3Settings::new()
+        .with_max_field_section_size(8192)
+        .with_qpack_max_table_capacity(4096);
+    let frame = Frame::Settings(settings);
+    let mut buf = [0u8; 64];
+    let n = frame.encode(&mut buf).unwrap();
+    assert_eq!(n, frame.encoded_len());
+    let (decoded, consumed) = Frame::decode(&buf[..n]).unwrap();
+    assert_eq!(decoded, frame);
+    assert_eq!(consumed, n);
+}
+
+#[test]
+fn encode_decode_roundtrip_push_promise() {
+    let frame = Frame::PushPromise {
+        push_id: 7,
+        field_section_length: 100,
+    };
+    let mut buf = [0u8; 16];
+    let n = frame.encode(&mut buf).unwrap();
+    assert_eq!(n, frame.encoded_len());
+    let (decoded, consumed) = Frame::decode(&buf[..n]).unwrap();
+    assert_eq!(decoded, frame);
+    assert_eq!(consumed, n);
+}
+
+#[test]
+fn encode_decode_roundtrip_priority_update() {
+    let frame = Frame::PriorityUpdate {
+        prioritized_element_id: 8,
+        priority: Priority::new(5),
+    };
+    let mut buf = [0u8; 32];
+    let n = frame.encode(&mut buf).unwrap();
+    assert_eq!(n, frame.encoded_len());
+    let (decoded, consumed) = Frame::decode(&buf[..n]).unwrap();
+    assert_eq!(decoded, frame);
+    assert_eq!(consumed, n);
+}
+
+#[test]
+fn encode_buffer_too_small() {
+    let frame = Frame::Goaway(42);
+    let mut buf = [0u8; 1]; // too small
+    assert!(frame.encode(&mut buf).is_none());
+}
+
+#[test]
+fn encode_unknown_is_noop() {
+    let frame = Frame::Unknown(500);
+    let mut buf = [0u8; 16];
+    assert_eq!(frame.encode(&mut buf), Some(0));
+    assert_eq!(frame.encoded_len(), 0);
+}
+
+// -- FrameStream payload buffering tests --
+
+mod frame_stream {
+    use super::{FrameStream, encode_raw_header};
+    use crate::Buffer;
+    use futures_lite::future::block_on;
+    use std::{
+        io::ErrorKind,
+        net::Shutdown,
+        pin::pin,
+        task::{Context, Poll, Waker},
+    };
+    use trillium_testing::TestTransport;
+
+    fn noop_context() -> Context<'static> {
+        Context::from_waker(Waker::noop())
+    }
+
+    #[test]
+    fn payload_assembles_across_dripped_reads() {
+        let (test_side, mut conn_side) = TestTransport::new();
+        let mut buffer = Buffer::default();
+        let mut stream = FrameStream::new(&mut conn_side, &mut buffer);
+        let mut cx = noop_context();
+
+        test_side.write_all(encode_raw_header(0x01u64, 12)); // HEADERS
+        let mut active = block_on(stream.next())
+            .expect("decodable frame header")
+            .expect("a frame, not eof");
+
+        let mut payload = pin!(active.buffer_payload());
+        for chunk in [b"abcd", b"efgh"] {
+            assert!(payload.as_mut().poll(&mut cx).is_pending());
+            test_side.write_all(chunk);
+        }
+        test_side.write_all(b"ijkl");
+        let Poll::Ready(Ok(bytes)) = payload.as_mut().poll(&mut cx) else {
+            panic!("payload should be complete after 12 bytes arrived");
+        };
+        assert_eq!(bytes, b"abcdefghijkl");
+    }
+
+    /// The declared frame length is adversary-controlled; buffering must track
+    /// bytes that actually arrive, in reads no larger than `FRAME_READ_CHUNK`.
+    #[test]
+    fn huge_declared_payload_buffers_proportionally_to_arrival() {
+        let (test_side, mut conn_side) = TestTransport::new();
+        let mut buffer = Buffer::default();
+        {
+            let mut stream = FrameStream::new(&mut conn_side, &mut buffer);
+            let mut cx = noop_context();
+
+            test_side.write_all(encode_raw_header(0x00u64, 1 << 30)); // DATA, 1gb declared
+            let mut active = block_on(stream.next())
+                .expect("decodable frame header")
+                .expect("a frame, not eof");
+
+            let mut payload = pin!(active.buffer_payload());
+            for _ in 0..4 {
+                assert!(payload.as_mut().poll(&mut cx).is_pending());
+                test_side.write_all(b"x");
+            }
+            assert!(payload.as_mut().poll(&mut cx).is_pending());
+        }
+
+        assert!(
+            buffer.capacity() <= 64 * 1024,
+            "buffer capacity {} tracked the declared length instead of arrived bytes",
+            buffer.capacity()
+        );
+    }
+
+    #[test]
+    fn eof_mid_payload_is_an_unexpected_eof_error() {
+        let (test_side, mut conn_side) = TestTransport::new();
+        let mut buffer = Buffer::default();
+        let mut stream = FrameStream::new(&mut conn_side, &mut buffer);
+
+        test_side.write_all(encode_raw_header(0x01u64, 8));
+        test_side.write_all(b"abc");
+        test_side.shutdown(Shutdown::Write);
+
+        let mut active = block_on(stream.next())
+            .expect("decodable frame header")
+            .expect("a frame, not eof");
+        let error = block_on(active.buffer_payload())
+            .expect_err("stream ended before the declared payload length");
+        assert_eq!(error.kind(), ErrorKind::UnexpectedEof);
+    }
+}

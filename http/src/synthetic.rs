@@ -1,0 +1,201 @@
+use crate::{
+    Conn, Headers, HttpConfig, HttpContext, KnownHeaderName, Method, ProtocolSession, TypeSet,
+    Version, after_send::AfterSend, conn::ConnInner, received_body::ReceivedBodyState,
+};
+use futures_lite::io::{AsyncRead, AsyncWrite, Cursor, Result};
+use std::{
+    borrow::Cow,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Instant,
+};
+
+/// Synthetic represents a simple transport that contains fixed content. This is exclusively useful
+/// for testing or for server implementations that are not read from an io connection, such as a
+/// faas function, in which the entire body may be available immediately on invocation.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct Synthetic {
+    data: Cursor<Vec<u8>>,
+    closed: bool,
+}
+
+impl AsyncRead for Synthetic {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize>> {
+        let Synthetic { data, closed } = &mut *self;
+        if *closed {
+            Poll::Ready(Ok(0))
+        } else {
+            match Pin::new(data).poll_read(cx, buf) {
+                Poll::Ready(Ok(0)) => Poll::Pending,
+                other => other,
+            }
+        }
+    }
+}
+
+impl Synthetic {
+    /// the length of this synthetic transport's body
+    #[doc(hidden)]
+    pub fn len(&self) -> usize {
+        self.data.get_ref().len()
+    }
+
+    /// predicate to determine if this synthetic contains no content
+    #[doc(hidden)]
+    pub fn is_empty(&self) -> bool {
+        self.data.get_ref().is_empty()
+    }
+
+    /// close this connection
+    #[doc(hidden)]
+    pub fn close(&mut self) {
+        self.closed = true;
+    }
+}
+
+impl AsyncWrite for Synthetic {
+    fn poll_write(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &[u8]) -> Poll<Result<usize>> {
+        Poll::Ready(Ok(0))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl From<Cursor<Vec<u8>>> for Synthetic {
+    fn from(data: Cursor<Vec<u8>>) -> Self {
+        Self {
+            data,
+            closed: false,
+        }
+    }
+}
+
+impl From<Vec<u8>> for Synthetic {
+    fn from(v: Vec<u8>) -> Self {
+        Cursor::new(v).into()
+    }
+}
+
+impl From<&[u8]> for Synthetic {
+    fn from(v: &[u8]) -> Self {
+        v.to_owned().into()
+    }
+}
+
+impl From<String> for Synthetic {
+    fn from(v: String) -> Self {
+        v.into_bytes().into()
+    }
+}
+
+impl From<&str> for Synthetic {
+    fn from(v: &str) -> Self {
+        v.as_bytes().into()
+    }
+}
+
+impl From<()> for Synthetic {
+    fn from((): ()) -> Self {
+        Vec::new().into()
+    }
+}
+
+impl From<Option<Vec<u8>>> for Synthetic {
+    fn from(v: Option<Vec<u8>>) -> Self {
+        v.unwrap_or_default().into()
+    }
+}
+
+impl Conn<Synthetic> {
+    /// Construct a new synthetic conn with provided method, path, and body.
+    /// ```rust
+    /// # use trillium_http::{Method, Conn};
+    /// let conn = Conn::new_synthetic(Method::Get, "/", "hello");
+    /// assert_eq!(conn.method(), Method::Get);
+    /// assert_eq!(conn.path(), "/");
+    /// ```
+    #[doc(hidden)]
+    pub fn new_synthetic(
+        method: Method,
+        path: impl Into<String>,
+        body: impl Into<Synthetic>,
+    ) -> Self {
+        let transport = body.into();
+        let mut request_headers = Headers::new();
+        request_headers.insert(KnownHeaderName::ContentLength, transport.len().to_string());
+        let request_body_state = ReceivedBodyState::new_h1(Some(transport.len() as u64), false);
+
+        Self {
+            inner: Box::new(ConnInner {
+                context: Arc::default(),
+                request_headers,
+                spare_request_headers: None,
+                response_headers: Headers::new(),
+                path: Cow::Owned(path.into()),
+                method,
+                status: None,
+                version: Version::Http1_1,
+                state: TypeSet::new(),
+                response_body: None,
+                buffer: Vec::with_capacity(HttpConfig::DEFAULT.request_buffer_initial_len).into(),
+                response_buffer: Vec::new(),
+                request_body_state,
+                secure: false,
+                after_send: AfterSend::default(),
+                start_time: Instant::now(),
+                peer_ip: None,
+                authority: None,
+                scheme: None,
+                protocol: None,
+                protocol_session: ProtocolSession::Http1,
+                request_trailers: None,
+                upgrade: false,
+                peer_gone: None,
+            }),
+            transport,
+        }
+    }
+
+    /// use a particular shared server config for this synthetic conn
+    #[doc(hidden)]
+    pub fn set_context(&mut self, context: Arc<HttpContext>) {
+        self.inner.context = Arc::new(context);
+    }
+
+    /// chainable setter for server config
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_context(mut self, context: Arc<HttpContext>) -> Self {
+        self.set_context(context);
+        self
+    }
+
+    /// simulate closing the transport
+    #[doc(hidden)]
+    pub fn close(&mut self) {
+        self.transport.close();
+    }
+
+    /// Replaces the synthetic body. This is intended for testing use.
+    #[doc(hidden)]
+    pub fn replace_body(&mut self, body: impl Into<Synthetic>) {
+        let transport = body.into();
+        self.request_headers_mut()
+            .insert(KnownHeaderName::ContentLength, transport.len().to_string());
+        self.inner.request_body_state =
+            ReceivedBodyState::new_h1(Some(transport.len() as u64), false);
+        self.transport = transport;
+    }
+}

@@ -1,0 +1,29 @@
+[package]
+name = "trillium-static-compiled-macros"
+version = "0.3.0"
+edition = "2024"
+description = "internal-use-only proc-macros for trillium-static-compiled"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/trillium-rs/trillium"
+readme = "README.md"
+keywords = ["trillium", "framework", "async"]
+categories = ["web-programming::http-server", "web-programming"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0.106"
+quote = "1.0.45"
+syn = "3.0.0"
+etag = { version = "4.0.0", features = ["std"] }
+brotli = { version = "9.0.0", optional = true }
+zstd = { version = "0.14.0", optional = true }
+flate2 = { version = "1.1.9", optional = true }
+rayon = { version = "1.10.0", optional = true }
+
+[features]
+default = []
+brotli = ["dep:brotli", "dep:rayon"]
+zstd = ["dep:zstd", "dep:rayon"]
+gzip = ["dep:flate2", "dep:rayon"]

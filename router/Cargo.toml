@@ -1,0 +1,22 @@
+[package]
+name = "trillium-router"
+version = "0.6.0"
+edition = "2024"
+description = "router for trillium.rs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/trillium-rs/trillium"
+readme = "README.md"
+keywords = ["trillium", "framework", "async", "router"]
+categories = ["web-programming::http-server", "web-programming"]
+
+[dependencies]
+log = "0.4.29"
+routefinder = { version = "0.6.0", features = ["memchr"] }
+# trillium-router needs Upgrade::push_path/Upgrade::pop_path
+trillium = { version = "1.4.0", path = "../trillium" }
+
+[dev-dependencies]
+env_logger = "0.11.10"
+trillium-logger = { path = "../logger" }
+trillium-smol = { path = "../smol" }
+trillium-testing = { path = "../testing" }

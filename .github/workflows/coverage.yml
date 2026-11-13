@@ -1,0 +1,52 @@
+name: coverage
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches:
+      - main
+
+jobs:
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: --cfg=quinn_testing
+      NEXTEST_PROFILE: ci
+    steps:
+      - name: Install mkcert
+        run: curl -JLO "https://dl.filippo.io/mkcert/latest?for=linux/amd64" && chmod +x mkcert-v*-linux-amd64 && sudo cp mkcert-v*-linux-amd64 /usr/local/bin/mkcert
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: generate a cert for tls testing
+        run: mkcert -install && mkcert localhost
+      - name: get-cmake
+        uses: lukka/get-cmake@v4.4.2
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2.9.3
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      # Single instrumented build, multiple test runs merged into one report.
+      # Doctests are intentionally excluded (nextest does not run them, and they
+      # are correctness/freshness checks for the docs, not coverage targets).
+      - name: Collect coverage (workspace under smol)
+        run: cargo llvm-cov --no-report nextest --workspace --features trillium-testing/smol,trillium-static/smol,trillium-http/serde
+      - name: Generate codecov report
+        run: cargo llvm-cov report --codecov --output-path codecov.json
+
+      - name: Upload to codecov.io
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{secrets.CODECOV_TOKEN}}
+          files: codecov.json
+          fail_ci_if_error: false

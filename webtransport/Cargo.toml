@@ -1,0 +1,38 @@
+[package]
+name = "trillium-webtransport"
+version = "0.2.0"
+edition = "2024"
+description = "WebTransport for trillium.rs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/trillium-rs/trillium"
+readme = "README.md"
+keywords = ["trillium", "framework", "async"]
+categories = ["web-programming::http-server", "web-programming"]
+
+[package.metadata.cargo-udeps.ignore]
+development = ["trillium-testing", "trillium-smol"]
+
+[dependencies]
+async-channel = "2"
+async-lock = "3"
+log = "0.4.29"
+trillium.workspace = true
+trillium-http = { workspace = true, features = ["unstable"] }
+swansong = "0.3"
+trillium-macros.workspace = true
+trillium-server-common.workspace = true
+futures-lite = "2.6.1"
+
+[dev-dependencies]
+env_logger = "0.11.10"
+rcgen = "0.14.7"
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
+tokio = { version = "1.51.1", features = ["rt", "macros", "time"] }
+trillium-client = { path = "../client", features = ["webtransport"] }
+trillium-logger = { path = "../logger" }
+trillium-quinn = { path = "../quinn" }
+trillium-rustls = { path = "../rustls" }
+trillium-smol = { path = "../smol" }
+trillium-static-compiled = { path = "../static-compiled" }
+trillium-testing = { path = "../testing" }
+trillium-tokio = { path = "../tokio" }

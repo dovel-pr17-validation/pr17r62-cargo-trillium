@@ -1,0 +1,559 @@
+use super::{Conn, H2Pooled, request_body_buffer::buffer_request_body};
+use crate::pool::{Acquire, PrimerGuard};
+use futures_lite::{AsyncReadExt, AsyncWriteExt, future::poll_once};
+use std::io::Write;
+use trillium_http::{
+    BodyFraming, BufWriter, Error, Headers, KnownHeaderName,
+    KnownHeaderName::{
+        Connection, ContentLength, Expect, Host, TransferEncoding, Upgrade as UpgradeHeader,
+    },
+    Method, ReceivedBodyState, Result, Status, Version,
+};
+use trillium_server_common::Transport;
+
+pub(crate) mod request_head;
+pub(crate) mod response_head;
+
+/// Result of the `Expect: 100-continue` wait: whether the interim `100` arrived (send the body)
+/// or a final response preempted it (the request is already complete).
+enum ExpectOutcome {
+    SendBody,
+    FinalResponse,
+}
+
+impl Conn {
+    pub(super) fn finalize_headers_h1(&mut self) -> Result<()> {
+        if self.headers_finalized {
+            return Ok(());
+        }
+
+        let host = self.url.host_str().ok_or(Error::UnexpectedUriFormat)?;
+
+        self.request_headers.try_insert_with(Host, || {
+            self.url
+                .port()
+                .map_or_else(|| host.to_string(), |port| format!("{host}:{port}"))
+        });
+
+        // A `:protocol` intent (see `Conn::protocol`) in its h1 form: the RFC 7230 `Upgrade`
+        // handshake, plus the protocol's own h1-only handshake headers. The same intent is sent
+        // as an extended CONNECT on h2/h3, where these headers are stripped again — see
+        // `finalize_headers_h2` / `finalize_headers_h3`.
+        if let Some(protocol) = self.protocol.clone() {
+            self.request_headers
+                .try_insert(UpgradeHeader, protocol.to_string());
+            self.request_headers.try_insert(Connection, "upgrade");
+            #[cfg(feature = "websockets")]
+            if protocol == "websocket" {
+                self.request_headers.try_insert_with(
+                    KnownHeaderName::SecWebsocketKey,
+                    trillium_websockets::websocket_key,
+                );
+            }
+        }
+
+        if self.client.pool().is_none() {
+            self.request_headers.try_insert(Connection, "close");
+        }
+
+        if self.upgrade {
+            if self.request_body.is_some() {
+                // A prelude body is sent as an open chunked stream (see `Body::keep_open`),
+                // continuing into the post-handoff `Upgrade`. Force chunked framing and drop
+                // any Content-Length — the stream is length-indeterminate.
+                self.request_headers.remove(ContentLength);
+                self.request_headers.insert(TransferEncoding, "chunked");
+            } else if !self.request_headers.has_header(ContentLength) {
+                // No prelude body: default the post-handoff stream to chunked framing so
+                // the server keeps reading past the response head.
+                self.request_headers.try_insert(TransferEncoding, "chunked");
+            }
+        } else {
+            let http_1_1 = self.http_version() >= Version::Http1_1;
+            let buffer_threshold = self.client.max_buffered_request_body() as u64;
+            match self.body_len() {
+                Some(0) => {}
+                Some(len) => {
+                    // A known-length body larger than we would buffer is worth an
+                    // `Expect: 100-continue` round-trip; a small one is cheaper to just send.
+                    if http_1_1 && len > buffer_threshold {
+                        self.request_headers.insert(Expect, "100-continue");
+                    }
+                    self.request_headers.insert(ContentLength, len);
+                }
+                None => {
+                    if http_1_1 {
+                        // A streaming body that overflowed the buffer benefits from asking
+                        // permission first; a fully-buffered one (small, or trailers-only) does
+                        // not — `buffer_request_body` already read it and it will be sent in one
+                        // shot.
+                        if !self.request_body_fully_buffered {
+                            self.request_headers.insert(Expect, "100-continue");
+                        }
+                        self.request_headers.insert(TransferEncoding, "chunked");
+                    }
+                    // HTTP/1.0: no chunked encoding; raw bytes are sent and connection close
+                    // signals end-of-body
+                }
+            }
+        }
+
+        self.headers_finalized = true;
+        Ok(())
+    }
+
+    /// Buffer a streaming, unknown-length request body up to the client's
+    /// [`max_buffered_request_body`](crate::Client::max_buffered_request_body) so the head can be
+    /// framed precisely. Skipped for upgrades (the stream stays open past the head) and HTTP/1.0
+    /// (raw, close-delimited bodies with no chunked/`Expect` framing).
+    async fn buffer_request_body(&mut self) -> Result<()> {
+        if self.upgrade || self.http_version() < Version::Http1_1 {
+            return Ok(());
+        }
+        let Some(body) = self.request_body.take() else {
+            return Ok(());
+        };
+        if body.len().is_some() {
+            self.request_body = Some(body);
+            return Ok(());
+        }
+        let (body, fully_buffered) =
+            buffer_request_body(body, self.client.max_buffered_request_body()).await?;
+        self.request_body = Some(body);
+        self.request_body_fully_buffered = fully_buffered;
+        Ok(())
+    }
+
+    async fn find_pool_candidate(&self, head: &[u8]) -> Result<Option<Box<dyn Transport>>> {
+        let mut byte = [0];
+        if let Some(pool) = self.client.pool() {
+            for mut candidate in pool.candidates(&self.pool_key()) {
+                if poll_once(candidate.read(&mut byte)).await.is_none()
+                    && candidate.write_all(head).await.is_ok()
+                {
+                    return Ok(Some(candidate));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    async fn build_head(&mut self) -> Result<Vec<u8>> {
+        let mut buf = Vec::with_capacity(128);
+        let url = &self.url;
+        let method = self.method;
+        write!(buf, "{method} ")?;
+
+        if let Some(target) = &self.request_target
+            && matches!(method, Method::Connect | Method::Options)
+        {
+            if method == Method::Options && *target == "*" && self.route.is_forward() {
+                // `*` reaches a proxy, not the origin, so the origin's server-wide OPTIONS is
+                // named in absolute-form with an empty path instead (RFC 9112 §3.2.4).
+                write!(buf, "{}", url.origin().ascii_serialization())?;
+            } else {
+                write!(buf, "{target}")?;
+            }
+        } else if method == Method::Connect {
+            let host = url.host_str().ok_or(Error::UnexpectedUriFormat)?;
+
+            let port = url
+                .port_or_known_default()
+                .ok_or(Error::UnexpectedUriFormat)?;
+
+            write!(buf, "{host}:{port}")?;
+        } else if self.route.is_forward() {
+            let mut target = url.clone();
+            let _ = target.set_username("");
+            let _ = target.set_password(None);
+            target.set_fragment(None);
+            write!(buf, "{target}")?;
+        } else {
+            write!(buf, "{}", url.path())?;
+            if let Some(query) = url.query() {
+                write!(buf, "?{query}")?;
+            }
+        }
+
+        write!(buf, " {}\r\n", self.http_version())?;
+        request_head::write_headers(&mut buf, &self.request_headers)?;
+
+        if let Some(proxy) = self.route.forward_proxy()
+            && let Some(values) = proxy
+                .connect_headers()
+                .get_values(KnownHeaderName::ProxyAuthorization)
+        {
+            request_head::write_headers(
+                &mut buf,
+                [(KnownHeaderName::ProxyAuthorization.into(), values)],
+            )?;
+        }
+        write!(buf, "\r\n")?;
+        log::trace!(
+            "{}",
+            String::from_utf8_lossy(&buf).replace("\r\n", "\r\n> ")
+        );
+
+        Ok(buf)
+    }
+
+    pub(crate) async fn read_head(&mut self) -> Result<usize> {
+        let Self {
+            buffer,
+            transport: Some(transport),
+            context,
+            ..
+        } = self
+        else {
+            return Err(Error::Closed);
+        };
+        response_head::read_head(transport, buffer, context.config()).await
+    }
+
+    async fn parse_head(&mut self) -> Result<()> {
+        let head_len = self.read_head().await?;
+        let head = response_head::parse_head(&self.buffer[..head_len])?;
+        self.buffer.ignore_front(head_len);
+
+        self.http_version = Some(head.version);
+        self.status = Some(Status::try_from(head.code)?);
+        // The network response head is authoritative: replace (not extend) any synthetic response
+        // headers a handler may have set — e.g. a `Content-Length` from `set_response_body` — so
+        // they can't merge with the wire headers into duplicates. Interim responses are cleared the
+        // same way in `reset_interim_response_state`.
+        self.response_headers = head.headers;
+
+        self.validate_response_headers()?;
+        Ok(())
+    }
+
+    async fn send_body_and_parse_head(&mut self) -> Result<()> {
+        // The upgrade path needs no special case here: `finalize_headers_h1` never sets
+        // `Expect: 100-continue` for an upgrade, so the 100-continue block is skipped, and
+        // `send_body` leaves the stream open (via `Body::keep_open`) instead of terminating
+        // it. The caller continues writing through `Upgrade` after consuming the conn.
+        if self
+            .request_headers
+            .eq_ignore_ascii_case(Expect, "100-continue")
+        {
+            log::trace!("Expecting 100-continue");
+
+            // Per RFC 9110 §10.1.1, don't wait indefinitely for `100 (Continue)`: it can't
+            // traverse an HTTP/1.0 intermediary and not every peer honors the expectation, so a
+            // client that waited forever would deadlock. On timeout, send the body anyway — the
+            // same thing we'd do without the expectation.
+            let expect_continue_timeout = self.client.expect_continue_timeout();
+            let runtime = self.client.connector().runtime();
+            let outcome = runtime
+                .timeout(expect_continue_timeout, async {
+                    loop {
+                        self.parse_head().await?;
+                        match self.status {
+                            Some(Status::Continue) => {
+                                self.reset_interim_response_state();
+                                log::trace!("Received 100-continue, sending request body");
+                                return Ok(ExpectOutcome::SendBody);
+                            }
+                            Some(other) if is_interim(other) => {
+                                log::trace!(
+                                    "Received interim response {other} while awaiting \
+                                     100-continue, continuing to wait"
+                                );
+                                self.reset_interim_response_state();
+                            }
+                            _ => {
+                                self.request_body.take();
+                                log::trace!(
+                                    "Received a status code other than 100-continue, not sending \
+                                     request body"
+                                );
+                                self.response_body_state = self.initial_response_body_state();
+                                return Ok(ExpectOutcome::FinalResponse);
+                            }
+                        }
+                    }
+                })
+                .await;
+
+            match outcome {
+                None => log::trace!(
+                    "Timed out after {expect_continue_timeout:?} awaiting 100-continue; sending \
+                     request body"
+                ),
+                Some(Ok(ExpectOutcome::SendBody)) => {}
+                Some(Ok(ExpectOutcome::FinalResponse)) => return Ok(()),
+                Some(Err(e)) => return Err(e),
+            }
+        }
+
+        self.send_body().await?;
+        loop {
+            self.parse_head().await?;
+            match self.status {
+                Some(other) if is_interim(other) => {
+                    log::trace!("Received interim response {other}, continuing to read");
+                    self.reset_interim_response_state();
+                }
+                _ => break,
+            }
+        }
+
+        self.response_body_state = self.initial_response_body_state();
+        Ok(())
+    }
+
+    fn reset_interim_response_state(&mut self) {
+        // Interim responses must not contribute headers to the final response, so clear them
+        // before reading the next head.
+        self.status = None;
+        self.response_headers = Headers::new();
+    }
+
+    async fn send_body(&mut self) -> Result<()> {
+        let Some(body) = self.request_body.take() else {
+            return Ok(());
+        };
+
+        // An upgrade leaves the chunked stream unterminated; the `Upgrade` owns the
+        // terminator. HTTP/1.0 doesn't support chunked transfer encoding, so an
+        // unknown-length body streams raw and connection close signals end-of-body.
+        let framing = if self.upgrade {
+            BodyFraming::Chunked { keep_open: true }
+        } else if body.len().is_none() && self.http_version() >= Version::Http1_1 {
+            BodyFraming::Chunked { keep_open: false }
+        } else {
+            BodyFraming::Raw
+        };
+
+        let config = *self.context.config();
+        let transport = self.transport.as_mut().ok_or(Error::Closed)?;
+        let mut bufwriter = BufWriter::new_with_buffer(
+            Vec::with_capacity(config.response_buffer_len()),
+            transport,
+            config.response_buffer_max_len(),
+        );
+
+        let trailers = body.write_into(&mut bufwriter, framing, &config).await?;
+
+        // When an upgrade follows, the `Upgrade` owns the terminator; the body's trailers
+        // (if any) ride onto it and merge with whatever the caller emits. Otherwise record
+        // trailers on the conn; only chunked framing has a wire representation for them —
+        // the trailer section, closed by the terminating CRLF.
+        if !self.upgrade {
+            self.request_trailers = trailers;
+            if framing == (BodyFraming::Chunked { keep_open: false }) {
+                if let Some(trailers) = &self.request_trailers {
+                    request_head::write_headers(bufwriter.buffer_mut(), trailers)?;
+                    log::trace!("sending request trailers: {trailers:?}");
+                }
+
+                write!(bufwriter.buffer_mut(), "\r\n")?;
+            }
+        }
+
+        bufwriter.flush().await?;
+        Ok(())
+    }
+
+    fn validate_response_headers(&self) -> Result<()> {
+        // `chunked` is the only transfer-coding trillium decodes, so the only Transfer-Encoding we
+        // can frame unambiguously is a single `chunked`. Multiple header lines coalesce into one
+        // ordered coding list, so we flatten across lines and commas, then require exactly one
+        // coding equal to `chunked`. Anything else — a repeated `chunked`, `chunked` not final,
+        // another/unknown coding, or an empty value — is rejected rather than decoded-once
+        // or read-to-close: those framing fallbacks are response-smuggling vectors. Matches
+        // the server's request-side rule so both halves of a proxy frame identically.
+        let chunked = if self.response_headers.has_header(TransferEncoding) {
+            let mut codings = self.response_headers.token_iter(TransferEncoding);
+            match (codings.next(), codings.next()) {
+                (Some(only), None) if only.eq_ignore_ascii_case("chunked") => true,
+                _ => return Err(Error::UnexpectedHeader(TransferEncoding.into())),
+            }
+        } else {
+            false
+        };
+
+        let content_length = self.response_headers.get_values(ContentLength);
+
+        if chunked && content_length.is_some() {
+            return Err(Error::UnexpectedHeader(ContentLength.into()));
+        }
+
+        // A malformed or duplicated Content-Length must be rejected, not coerced to read-to-close
+        // (as `get_str(..).parse().ok()` silently would) — that's a response-smuggling vector via
+        // trillium-proxy. Shared with the server request parser so both reject identically.
+        trillium_http::validate_content_length(content_length)?;
+        Ok(())
+    }
+
+    /// Whether the underlying transport will be kept alive and pooled for h1 reuse after this
+    /// response's body is consumed — the keep-alive decision the recycle path acts on. Always
+    /// `false` for h2/h3: those connections are reused through their own multiplexing pools, and
+    /// the transport on the conn is a spent single-use stream rather than a poolable connection.
+    /// Exposed (hidden) for the response-parser corpus harness.
+    ///
+    /// For h1: HTTP/1.1 is persistent unless a `Connection: close` appears on either side;
+    /// HTTP/1.0 is non-persistent unless both sides send `Connection: keep-alive`.
+    #[doc(hidden)]
+    pub fn is_keep_alive(&self) -> bool {
+        // Keep-alive is an HTTP/1.x connection-persistence concept. An h2/h3 conn's transport is a
+        // single-use stream and connection reuse lives in the h2/h3 pools, so it is never
+        // h1-poolable — without this guard the `!= Http1_0` fallback below would wrongly say it is.
+        if self.http_version() > Version::Http1_1 {
+            return false;
+        }
+
+        let has_token = |headers: &Headers, token: &str| {
+            headers
+                .token_iter(Connection)
+                .any(|t| t.eq_ignore_ascii_case(token))
+        };
+
+        if has_token(&self.request_headers, "close") || has_token(&self.response_headers, "close") {
+            false
+        } else if has_token(&self.request_headers, "keep-alive")
+            && has_token(&self.response_headers, "keep-alive")
+        {
+            true
+        } else {
+            self.http_version() != Version::Http1_0
+        }
+    }
+
+    pub(super) fn response_content_length(&self) -> Option<u64> {
+        if self.status == Some(Status::NoContent)
+            || self.status == Some(Status::NotModified)
+            || self.method == Method::Head
+        {
+            Some(0)
+        } else {
+            self.response_headers.content_length()
+        }
+    }
+
+    /// Resolve the initial [`ReceivedBodyState`] for the inbound response body from
+    /// the parsed status, method, and response headers. HEAD requests and 204/304
+    /// responses produce [`ReceivedBodyState::End`] regardless of headers; chunked
+    /// transfer-encoding produces [`ReceivedBodyState::Chunked`]; everything else —
+    /// including responses without explicit framing, which become read-to-close —
+    /// produces [`ReceivedBodyState::Raw`].
+    fn initial_response_body_state(&self) -> ReceivedBodyState {
+        if self.status == Some(Status::NoContent)
+            || self.status == Some(Status::NotModified)
+            || self.method == Method::Head
+        {
+            return ReceivedBodyState::End;
+        }
+        // `validate_response_headers` (run during `parse_head`) has already established that a
+        // Transfer-Encoding, if present, is exactly a single `chunked` and never coexists with
+        // Content-Length — so its mere presence means chunked framing.
+        let chunked = self.response_headers.has_header(TransferEncoding);
+        let content_length = self.response_headers.content_length();
+        ReceivedBodyState::new_h1(content_length, chunked)
+    }
+
+    pub(super) async fn exec_h1_or_promote_h2(&mut self) -> Result<()> {
+        // An h3 hint reaches here when h3 is unavailable or the route uses a proxy; resume
+        // auto-discovery (h1 / ALPN-promoted h2) rather than pinning, matching the
+        // h3-connect-failure fallback. An explicit h1.1 / h1.0 pin is left intact.
+        if matches!(self.http_version, Some(v) if v > Version::Http1_1) {
+            self.http_version = None;
+        }
+
+        self.buffer_request_body().await?;
+        self.finalize_headers_h1()?;
+        let head = self.build_head().await?;
+
+        // An idle keepalive transport for this origin short-circuits the connect entirely.
+        if let Some(transport) = self.find_pool_candidate(&head).await? {
+            log::debug!("reusing connection to {:?}", transport.peer_addr()?);
+            return self.exec_h1_on_transport(transport).await;
+        }
+
+        // Cold connect. With no version pin, coalesce concurrent cold-starts to this origin through
+        // the h2 pool's in-flight slot: when the connection turns out to be multiplexed (ALPN
+        // `h2`), a burst opens one connection and the waiters share it rather than each opening
+        // their own. An explicit h1 pin skips this — it neither shares an h2 connection nor
+        // promotes one — and its connection advertises only `http/1.1` (see `origin_destination`).
+        let h2_pool = if self.http_version.is_none() && !self.route.is_forward() {
+            self.client.h2_pool().cloned()
+        } else {
+            None
+        };
+        if let Some(h2_pool) = h2_pool {
+            match h2_pool.acquire(self.pool_key(), |p| p.classify()) {
+                Acquire::Ready(pooled) => {
+                    return self
+                        .exec_h2_on_connection(pooled.connection().clone())
+                        .await;
+                }
+                Acquire::Await(cell) => {
+                    if let Some(pooled) = cell.wait().await {
+                        return self
+                            .exec_h2_on_connection(pooled.connection().clone())
+                            .await;
+                    }
+                    // The primer produced no shareable connection (it went h1, or its connect
+                    // failed); connect for ourselves below.
+                }
+                Acquire::Primer(guard) => {
+                    return self.connect_and_dispatch(head, Some(guard)).await;
+                }
+            }
+        }
+
+        self.connect_and_dispatch(head, None).await
+    }
+
+    /// Run the request over an h1 transport (pooled or freshly connected), then learn any
+    /// h3 endpoint the response advertises via `Alt-Svc`.
+    async fn exec_h1_on_transport(&mut self, transport: Box<dyn Transport>) -> Result<()> {
+        self.transport = Some(transport);
+        self.send_body_and_parse_head().await?;
+        if let Some(h3) = self.client.h3() {
+            self.update_alt_svc_from_response(h3);
+        }
+        Ok(())
+    }
+
+    /// Open a fresh connection and dispatch the request: promote to h2 when ALPN negotiates it,
+    /// otherwise send over h1.
+    ///
+    /// `guard` is `Some` when we are the elected primer for this origin's in-flight slot —
+    /// resolving it (or dropping it on a connect error) releases any waiters. It is `None` when
+    /// pooling is disabled, or when we are a waiter that fell through to its own connect.
+    async fn connect_and_dispatch(
+        &mut self,
+        head: Vec<u8>,
+        guard: Option<PrimerGuard<super::RouteKey, H2Pooled>>,
+    ) -> Result<()> {
+        // On a connect error, `?` returns and `guard` drops here, waking any waiters to connect
+        // for themselves rather than hang.
+        let mut transport = self.connect_route().await?;
+        log::debug!("opened new connection to {:?}", transport.peer_addr()?);
+
+        // Promote to h2 only when auto-discovering: an explicit h1 pin advertised only `http/1.1`
+        // (see `origin_destination`), so a peer that nonetheless reports `h2` here is honored as an
+        // h1 connection rather than overriding the pin.
+        if self.http_version.is_none()
+            && !self.route.is_forward()
+            && self.client.h2_pool().is_some()
+            && transport.negotiated_alpn().as_deref() == Some(b"h2")
+        {
+            return self.promote_and_exec_h2(transport, guard).await;
+        }
+
+        // Not multiplexed: release any waiters to connect for themselves, then send over h1.
+        if let Some(guard) = guard {
+            guard.resolve_absent();
+        }
+        transport.write_all(&head).await?;
+        self.exec_h1_on_transport(transport).await
+    }
+}
+
+/// All 1xx codes are interim *except* `101 Switching Protocols`, which is a final response
+/// that hands the connection off to a different protocol.
+fn is_interim(status: Status) -> bool {
+    status.is_informational() && status != Status::SwitchingProtocols
+}

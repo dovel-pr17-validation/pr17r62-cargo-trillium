@@ -1,0 +1,219 @@
+# HTTP Client
+
+[rustdocs](https://docs.trillium.rs/trillium_client)
+
+`trillium-client` is a full HTTP client that mirrors the server-side `Conn` design. It supports HTTP/1.0, HTTP/1.1, HTTP/2, and HTTP/3, HTTPS, connection pooling, and WebSocket upgrades (including over h2).
+
+The client is runtime-agnostic and uses the same connector pattern as the server adapters.
+
+## Basic usage
+
+```rust
+# [dependencies]
+# trillium-smol = { path = "../smol" }
+# trillium-client = { path = "../client" }
+# trillium-testing = { path = "../testing" }
+#
+use trillium_client::Client;
+use trillium_smol::ClientConfig;
+
+async fn fetch() {
+    let client = Client::new(ClientConfig::default());
+
+    let body = client
+        .get("http://example.com/")
+        .await
+        .unwrap()
+        .success()
+        .unwrap()
+        .response_body()
+        .await
+        .unwrap();
+
+    println!("{body}");
+}
+
+# fn main() {
+#     trillium_testing::block_on(fetch());
+# }
+```
+
+`ClientConfig` comes from your chosen runtime crate. The `success()` method returns an error if the status is not 2xx.
+
+## HTTPS
+
+Wrap `ClientConfig` with a TLS config:
+
+```rust
+# [dependencies]
+# trillium-smol = { path = "../smol" }
+# trillium-client = { path = "../client" }
+# trillium-rustls = { path = "../rustls" }
+# trillium-testing = { path = "../testing" }
+#
+# fn main() { trillium_testing::block_on(async {
+use trillium_client::Client;
+use trillium_rustls::RustlsConfig;
+use trillium_smol::ClientConfig;
+
+let client = Client::new(RustlsConfig::<ClientConfig>::default());
+let conn = client.get("https://example.com/").await.unwrap();
+# }) }
+```
+
+`trillium-native-tls` and `trillium-openssl` can be used instead of `trillium-rustls` with the same pattern.
+
+## HTTP/2
+
+Over `https://` with a `trillium-rustls` connector, HTTP/2 is automatically negotiated when the server selects `h2` in ALPN. No code changes are required — every example above already speaks h2 against an h2-capable server.
+
+To opt out, drop `h2` from the advertised ALPN list:
+
+```rust
+# [dependencies]
+# trillium-smol = { path = "../smol" }
+# trillium-rustls = { path = "../rustls" }
+# trillium-client = { path = "../client" }
+#
+use trillium_client::Client;
+use trillium_rustls::RustlsConfig;
+use trillium_smol::ClientConfig;
+
+# fn main() {
+let client = Client::new(RustlsConfig::<ClientConfig>::default().without_http2());
+# }
+```
+
+That opts out for every request on the client. To force HTTP/1.1 for a single request instead — pinning h1.1 even when the connector would negotiate h2 via ALPN or h3 via `Alt-Svc` — set the per-request hint:
+
+```rust
+# [dependencies]
+# trillium-smol = { path = "../smol" }
+# trillium-client = { path = "../client" }
+# trillium-testing = { path = "../testing" }
+#
+# fn main() { trillium_testing::block_on(async {
+# use trillium_client::Client;
+# use trillium_smol::ClientConfig;
+use trillium_client::Version;
+
+# let client = Client::new(ClientConfig::default());
+let conn = client
+    .get("https://example.com/")
+    .with_http_version(Version::Http1_1)
+    .await
+    .unwrap();
+# }); }
+```
+
+For TLS connectors that don't surface ALPN selection (`trillium-native-tls` at time of writing) or for cleartext h2c, set the per-request prior-knowledge hint:
+
+```rust
+# [dependencies]
+# trillium-smol = { path = "../smol" }
+# trillium-client = { path = "../client" }
+# trillium-testing = { path = "../testing" }
+#
+# fn main() { trillium_testing::block_on(async {
+# use trillium_client::Client;
+# use trillium_smol::ClientConfig;
+use trillium_client::Version;
+
+# let client = Client::new(ClientConfig::default());
+let conn = client
+    .get("http://localhost:8080/")
+    .with_http_version(Version::Http2)
+    .await
+    .unwrap();
+# }); }
+```
+
+`Version::Http2` skips ALPN inspection and starts the h2 driver immediately — there is no fallback if the server doesn't speak h2. See the [`trillium_client` rustdocs](https://docs.trillium.rs/trillium_client) for the full prior-knowledge table.
+
+HTTP/2 connections are pooled and multiplex concurrent requests over a single TCP+TLS connection. `Client::with_h2_idle_timeout`, `with_h2_idle_ping_threshold`, and `with_h2_idle_ping_timeout` tune idle and health-check behavior.
+
+## HTTP/3
+
+When built using `Client::new_with_quic`, the client upgrades to HTTP/3 automatically when a server advertises support via `Alt-Svc`. The first request to a host uses HTTP/1.1; if the response includes `Alt-Svc: h3=...`, subsequent requests to that host use HTTP/3.
+
+```rust
+# [dependencies]
+# trillium-tokio = { path = "../tokio" }
+# trillium-client = { path = "../client" }
+# trillium-quinn = { path = "../quinn" }
+# trillium-rustls = { path = "../rustls" }
+# trillium-testing = { path = "../testing" }
+#
+# fn main() { trillium_testing::block_on(async {
+use trillium_client::Client;
+use trillium_quinn::ClientQuicConfig;
+use trillium_rustls::RustlsConfig;
+use trillium_tokio::ClientConfig;
+
+let client = Client::new_with_quic(
+    RustlsConfig::<ClientConfig>::default(),
+    ClientQuicConfig::default(),
+);
+
+// Request 1: HTTP/1.1 (no Alt-Svc cached)
+// Request 2+: HTTP/3 if the server advertised it
+for _ in 0..3 {
+    let conn = client.get("https://cloudflare.com/").await.unwrap();
+    println!("{:?}", conn.http_version());
+}
+# }); }
+```
+
+## Making requests
+
+The client has methods for each HTTP verb. Each returns a `Conn` that you can configure before sending:
+
+```rust
+# [dependencies]
+# trillium-smol = { path = "../smol" }
+# trillium-client = { path = "../client" }
+# trillium-testing = { path = "../testing" }
+#
+# fn main() { trillium_testing::block_on(async {
+# use trillium_client::Client;
+# use trillium_smol::ClientConfig;
+# let client = Client::new(ClientConfig::default());
+let conn = client
+    .post("https://api.example.com/items")
+    .with_request_header("content-type", "application/json")
+    .with_body(r#"{"name":"widget"}"#)
+    .await
+    .unwrap();
+
+println!("status: {}", conn.status().unwrap());
+# }); }
+```
+
+A `base` URL can be set on the `Client` so each request only names its own path:
+
+```rust
+# [dependencies]
+# trillium-smol = { path = "../smol" }
+# trillium-client = { path = "../client" }
+#
+# fn main() {
+# use trillium_client::Client;
+# use trillium_smol::ClientConfig;
+let client = Client::new(ClientConfig::default()).with_base("https://api.example.com");
+let conn = client.get("/items"); // resolves against the base
+# let _ = conn;
+# }
+```
+
+## Connection pooling
+
+Connections are pooled and reused automatically across requests to the same host. HTTP/1.1, HTTP/2, and HTTP/3 each have their own pool; HTTP/2 multiplexes concurrent requests over a single connection.
+
+If a single `Client` is used against a large number of distinct hosts, the pool retains a small per-host footprint. Call `Client::clean_up_pool` intermittently to release idle entries.
+
+## What's next
+
+- [Client middleware](./middleware.md) — logging, cookies, compression, redirect-following, retrying, and caching as composable `ClientHandler`s.
+- [Encrypted DNS](./encrypted-dns.md) — route lookups through DoH/DoT/DoQ for privacy and DNS-level HTTP/3 discovery.
+- [Outbound proxies](./proxies.md) — explicit routing, CONNECT tunnels, environment settings, and bypass rules.
+- [WebSockets, WebTransport, and JSON](./extras.md) — feature-gated client capabilities.

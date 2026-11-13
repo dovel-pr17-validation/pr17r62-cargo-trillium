@@ -1,0 +1,658 @@
+# Changelog
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [1.8.2] - 2026-11-10
+
+### Changed
+
+- An HTTP/3 request stream is now closed once its response has been sent in full, unless it's being
+  upgraded. It used to be left for the transport to finish when dropped, which couldn't tell a
+  complete response from an abandoned one.
+
+### Fixed
+
+- Canceling an HTTP/2 client request no longer closes the shared connection when late frames
+  arrive for that request. Canceling before the request is sent also leaves the connection usable.
+- An HTTP/2 connection could fail every later request with a compression error after a stream was
+  refused for exceeding the concurrent-stream limit, or after headers arrived for a stream that was
+  already reset or that named itself as its priority dependency. Those streams are still rejected,
+  and the connection stays usable.
+- An HTTP/2 connection could gradually stall, with every stream waiting on flow control, after
+  requests were canceled with response data still unread, handlers finished without reading a
+  request body, or the peer sent padded or late DATA frames. The window those bytes held is now
+  returned to the peer.
+- When an HTTP/2 request or response body failed partway through sending, the peer was never told
+  and waited on the stream indefinitely. The stream is now reset with `INTERNAL_ERROR`.
+- An HTTP/2 body that ended before its declared length was sent as if complete. The stream is now
+  reset with `INTERNAL_ERROR`.
+- A panic in an HTTP/2 request or response body — reading it, producing its trailers, or dropping
+  it — took down every stream on the connection. Such a panic is now logged and affects only that
+  body's stream: one while the body is being sent resets the stream with `INTERNAL_ERROR`.
+- An HTTP/1 or HTTP/3 body that ended before its declared length was sent as if complete. An
+  HTTP/1 client could then wait for bytes that never came, or read the next response on the
+  connection as the rest of the body. Sending such a body now fails with `UnexpectedEof`, which
+  closes the HTTP/1 connection or abandons the HTTP/3 stream.
+- When an HTTP/2 server handler panicked, the client saw its stream canceled. It now gets a `500`
+  response if the handler hadn't started responding, and `RST_STREAM(INTERNAL_ERROR)` otherwise.
+
+## [1.8.1] - 2026-11-05
+
+This release contains only supporting content for `trillium-client`, exposed through the unstable
+feature
+
+## [1.8.0] - 2026-10-22
+
+### Added
+
+- `H2Driver::close`, which shuts down the sending side of an HTTP/2 connection and then waits for
+  the peer to close its side. Dropping the driver instead can answer a peer that is still sending
+  with a TCP reset, which may destroy data it hasn't read yet.
+- `h1::H1Connection`, for serving HTTP/1.x on a transport: `H1Connection::new(context, transport)`,
+  optionally `with_initial_bytes`, then `run(handler)`. It resolves to an `H1ConnectionResult`
+  reporting an upgrade, an error, or a close. A close carries an `H1Close`, which closes the
+  connection the same way `H2Driver::close` does when awaited, and hangs up immediately when
+  dropped. `HttpContext::run` behaves as before.
+- `Error::UnsupportedVersionNumber`, for a request that names a well-formed HTTP version this
+  implementation doesn't speak.
+
+### Changed
+
+- Performance improvements, particularly in the per-request cost of HTTP/1.x and HTTP/2.
+- `HttpConfig::copy_loops_per_yield` now also bounds how many new requests an HTTP/2 connection
+  starts before yielding to the runtime, so a burst of requests on one connection reaches its
+  handlers sooner.
+- An HTTP/1.x request-line naming a well-formed HTTP version other than 1.x, such as `HTTP/2.0` or
+  `HTTP/0.9`, now gets `505 HTTP Version Not Supported` instead of `400 Bad Request`. A malformed
+  version still gets 400.
+
+### Deprecated
+
+- `run_with_initial_bytes`, in favor of `H1Connection::new(context, transport).with_initial_bytes(..)`.
+
+### Fixed
+
+- `Body::into_bytes` could exhaust memory or panic on a streaming body that declared an enormous
+  length, before any of its content arrived. Memory use now follows the content actually received.
+- HTTP/3 bodies that ended inside a frame payload were reported as a clean end of body
+  instead of an error, so a request or response truncated mid-frame could be read as
+  complete. Truncation is now an `UnexpectedEof`.
+- An HTTP/2 PING queued with `H2Connection::send_ping` while the connection was otherwise idle
+  could go unsent, and its future unresolved, until other traffic arrived on the connection.
+- An HTTP/1.x request with an unrecognized method got `501 Not Implemented` even when it was also
+  malformed in some other way, such as an invalid HTTP version or a missing `Host` header. Those
+  requests now get `400 Bad Request`, and `501` is reserved for otherwise well-formed requests.
+- An HTTP/1.x request head longer than the configured `head_max_len` closed the connection without
+  a response. It now gets `431 Request Header Fields Too Large` when the header fields overflowed,
+  `414 URI Too Long` when the request-target did, and `501 Not Implemented` when the method did.
+
+
+## [1.7.2] - 2026-09-08
+
+### Changed
+
+- Performance: For HTTP 1.1, 2, and 3, parsing headers allocates less
+
+### Fixed
+
+- HTTP/2 header compression did not use the dynamic table when the peer's SETTINGS omitted
+  `SETTINGS_HEADER_TABLE_SIZE`, so repeated headers were sent as full literals on every
+  request. They are now sent as indexed references after their first occurrence.
+
+
+## [1.7.1] - 2026-09-08
+
+### Changed
+
+- Replaced the `smartstring` dependency with `compact_str`, per
+  [RUSTSEC-2026-0249](https://rustsec.org/advisories/RUSTSEC-2026-0249.html). This entails no public
+  API change, and there are no known security or performance consequences. Thanks to
+  [max3163](https://github.com/max3163) for
+  [reporting](https://github.com/trillium-rs/trillium/issues/965)
+
+## [1.7.0] - 2026-09-01
+
+### Added
+
+- `Upgrade::poll_closed`, a liveness probe that resolves when the peer has abandoned the
+  upgrade. For use when the peer is not expected to send data: on HTTP/1.x it probes by
+  reading, buffering up to a caller-provided allowance of incidental bytes; on HTTP/2 and
+  HTTP/3 it observes stream reset, cancellation, and connection teardown without reading.
+
+- `PeerGone` and `H3BidiRequest::with_peer_gone`, through which a runtime adapter reports
+  QUIC stream abandonment. HTTP/3 signals departure out-of-band from the byte stream, so
+  without this hook `Conn::is_disconnected`, `Conn::cancel_on_disconnect`, and
+  `Upgrade::poll_closed` cannot detect it.
+
+### Fixed
+
+- `Conn::is_disconnected` and `Conn::cancel_on_disconnect` reported every live HTTP/2 and
+  HTTP/3 request as disconnected. Both probed by reading the transport, which is only
+  meaningful on HTTP/1.x — an HTTP/2 request carries `END_STREAM` on its HEADERS and an
+  HTTP/3 client finishes its half of the bidi stream, so the read half of a perfectly
+  healthy request is at end-of-file from the first poll. They now dispatch per protocol,
+  observing stream state on HTTP/2 and peer abandonment on HTTP/3.
+
+### Changed
+
+- An HTTP/1.1 conn marked for upgrade with `Connection: close` set, no response body, and
+  no `Content-Length` now sends a close-delimited response — no `Transfer-Encoding:
+  chunked` — matching the framing non-upgrade responses take under the same headers.
+
+## [1.6.4] - 2026-08-25
+
+### Security
+
+- HTTP/1.x request heads: a peer pacing a malformed head one byte at a time (or
+  fragmenting it at the TCP layer) drove the request buffer's capacity to double
+  on every read-loop iteration, reaching multiple gibibytes from a few dozen
+  dribbled bytes and killing the process. Head buffering is now bounded by the
+  `head_max_len` allowance regardless of fragmentation or pacing.
+
+### Changed
+
+- `Conn::cancel_on_disconnect` and `Conn::is_disconnected` now buffer at most
+  16kb of unread bytes from the peer while probing for disconnection,
+  replacing unbounded buffering under pipelining. A peer with 16kb of
+  buffered unread bytes is reported as alive until they are read; reading the
+  request body before long-running work restores full disconnect detection.
+
+## [1.6.3] - 2026-08-24
+
+### Fixed
+
+- An h1 conn marked for upgrade now hands off to the upgrade even when the request carried
+  `Connection: close`. Previously the close was honored first, dropping the transport before the
+  upgrade could write its post-handoff response bytes.
+
+## [1.6.2] - 2026-08-23
+
+### Fixed
+
+- HTTP/3 control-stream decoding: a well-formed GOAWAY, CANCEL_PUSH, or MAX_PUSH_ID frame received
+  in the same read buffer as any subsequent frame was misrejected as H3_FRAME_ERROR, closing the
+  connection
+
+### Security
+
+- HTTP/1.x chunked framing: a chunk-size token within 2 of `u64::MAX` wrapped the framing allowance
+  in release builds, silently truncating the chunk and allowing trailing attacker-chosen bytes to be
+  reframed as the next request on a reused connection. Such size lines are now rejected.
+- HTTP/1.x chunked trailers: the trailer-section accumulated after a chunked body's last-chunk
+  marker was unbounded, letting a single connection pin unbounded memory by streaming trailer bytes
+  without a terminator. It is now capped at `HttpConfig::max_header_list_size`.
+- HTTP/1.x `Expect: 100-continue`: a request whose body was never read reuses the connection without
+  draining, so body bytes arriving anyway could be parsed as the next request. The response now
+  carries `Connection: close` in that case.
+
+## [1.6.1] - 2026-08-16
+
+### Fixed
+
+- `Conn::host()` now falls back to the `:authority` pseudo-header when no `Host` header is
+  present, so it returns the request's host on HTTP/2 and HTTP/3, where clients generally
+  omit `Host`. Previously it returned `None` for most h2/h3 requests.
+
+## [1.6.0] - 2026-07-18
+
+### Changed
+
+- When a content-type declares no recognizable `charset` parameter, body-to-string decoding
+  (`ReceivedBody::read_string`, `Conn::request_encoding` / `response_encoding`, and the
+  `Upgrade` body) now assumes UTF-8 instead of windows-1252. Unlabeled UTF-8 bodies — including
+  all `application/json`, which has no charset parameter — previously decoded non-ASCII
+  content to mojibake and now decode correctly. Unlabeled content that is genuinely
+  windows-1252 now yields replacement characters instead; declare the charset, or read the
+  bytes and decode explicitly. A declared charset behaves as before.
+
+## [1.5.2] - 2026-07-13
+
+### Fixed
+
+- Supporting changes for a trillium-client fix: pooled HTTP/2 connections no longer hang
+  requests after the server closes the connection abruptly. See trillium-client's
+  changelog for the user-facing details.
+
+## [1.5.1] - 2026-07-11
+
+### Fixed
+
+- On a server-side HTTP/1.x upgrade from a request with no body-framing headers (no
+  `Content-Length` or `Transfer-Encoding` — the shape of a browser's WebSocket handshake),
+  reading from the `Upgrade` returned EOF immediately even though the peer was still
+  connected, so such connections appeared to disconnect as soon as they opened. Reads now
+  yield the peer's post-upgrade bytes. Upgrades from requests that declare chunked framing
+  continue to decode it, as before.
+
+## [1.5.0] - 2026-07-10
+
+### Added
+
+- `H3BidiRequest::with_request_rejection()`: treat an HTTP request on an inbound bidirectional
+  stream as a protocol violation instead of serving it. The handler is skipped, nothing is
+  written to the stream, the `with_reset` hook is invoked with `H3_STREAM_CREATION_ERROR`, and
+  awaiting resolves to that error. For peers — such as HTTP/3 clients — that accept inbound
+  bidirectional streams only for negotiated extensions.
+
+- `HttpConfig::body_write_chunk_len` (default 8 KiB): how many bytes of a streaming body are
+  read and framed at a time on the HTTP/1.x and HTTP/3 send paths, and the send-buffer fill
+  level that triggers a write to the transport while a body streams. Larger values batch more
+  bytes per write at the cost of that much buffer memory per in-flight streaming body. The
+  default matches the previously-fixed internal behavior.
+
+- `HttpConfig::recent_pairs_auto` (default `true`): the HPACK and QPACK encoders now derive
+  their recently-seen-pair ring size and dynamic-table insert threshold from each
+  connection's negotiated table capacity, instead of using a fixed 64-slot ring and a fixed
+  insert-on-second-sighting trigger at every capacity. Offline measurement against an
+  HTTP Archive response-header corpus showed the fixed tuning losing to a static-table-only
+  encoder at small capacities (evict/re-insert churn) and on short connections
+  (second-sighting inserts that never amortize); the derived tuning never lost to
+  static-only at any measured capacity or connection length. Setting
+  `recent_pairs_size` explicitly disables the derivation and restores the fixed behavior.
+- Under `recent_pairs_auto`, the QPACK encoder also warm-inserts a name-only `(name, "")`
+  dynamic-table entry for a static-table-miss name on its third sighting, so headers whose
+  values never repeat (request ids, trace ids) still earn a 1–2 byte dynamic name reference
+  instead of literal name bytes on every section. QPACK-only: HPACK inserts are inline
+  field lines, so it has no way to add a name without emitting a bogus empty-valued header.
+
+### Changed
+
+- Performance: sending a body over HTTP/1.x or HTTP/3 no longer allocates an intermediary
+  buffer or copies body content through it. A response with an in-memory body now goes out in
+  a single vectored write together with the response head; streaming bodies are framed
+  directly into the send buffer. Wire output is unchanged.
+
+- Performance: reading a chunked HTTP/1.x body or an HTTP/3 body no longer allocates per read,
+  and payload that is already contiguous at the front of the read buffer is no longer copied
+  onto itself. Decoded output is unchanged.
+
+### Fixed
+
+- HTTP/3 field-section size enforcement against the peer's declared maximum field section size now
+  measures the *uncompressed* size. A field section that fits the limit once compressed but exceeds
+  it uncompressed is now correctly rejected.
+
+- `H3Connection::run_outbound_control`, `run_encoder`, and `run_decoder` now shut the connection
+  down (equivalent to `H3Connection::shut_down`) when they return, on both the error and clean
+  paths. After completion, the connection status can be relied upon to reflect this state correctly.
+
+## [1.4.2] - 2026-07-04
+
+### Fixed
+- On a long-lived HTTP/2 connection, RFC 9218 `PRIORITY_UPDATE` signals are no longer silently
+  ignored after many streams have come and gone. A closed stream now releases its tracked
+  priority; previously entries accumulated until the bounded tracking table was full, after which
+  every later `PRIORITY_UPDATE` for a new stream was dropped and that response fell back to
+  default priority.
+
+## [1.4.1] - 2026-07-04
+
+This release contains only supporting content for `trillium-client`, exposed through the unstable
+feature
+
+## [1.4.0] - 2026-07-02
+
+### Added
+
+- A new `rkyv_08` feature implements rkyv 0.8's `Archive`, `Serialize`, and `Deserialize` for
+  `Version`, `Method`, `Status`, `HeaderName`, `HeaderValue`, `HeaderValues`, and `Headers`. These
+  types round-trip losslessly through `rkyv::to_bytes` / `rkyv::from_bytes` — including non-utf8
+  header values, repeated header values, and the HPACK/QPACK never-indexed bit — making them
+  suitable for durable binary persistence such as an on-disk response cache. Header names are
+  stored as strings, so the format does not depend on the release-unstable `KnownHeaderName`
+  discriminant.
+
+## [1.3.10] - 2026-06-24
+
+### Fixed
+
+- A streaming response body that pauses between writes — most visibly a long-lived Server-Sent
+  Events stream — no longer withholds already-written bytes from the client. Previously, output
+  small enough to fit the internal write buffer could sit unsent until the body produced enough
+  further data to overflow the buffer or until the stream ended; each chunk is now delivered as
+  soon as the body has nothing more ready. Bodies that run to completion without pausing are
+  unaffected.
+
+## [1.3.9] - 2026-06-21
+
+### Added
+
+- `Headers::token_iter(name)` iterates the comma-separated tokens of a list-typed header
+  (`Connection`, `Transfer-Encoding`, `Accept-Encoding`, and the like), flattened across every
+  field line, trimmed, with empty elements skipped.
+- `request_header_initial_capacity` sizes the request header map's preallocation, mirroring the
+  existing `response_header_initial_capacity`.
+
+### Changed
+
+- An HTTP/1.1 response that sets `Connection: close` on a streaming body of unknown length is now
+  sent close-delimited — carrying neither `Content-Length` nor `Transfer-Encoding`, with the body
+  running until the connection closes — rather than with chunked transfer-encoding. Responses that
+  don't set `Connection: close` are unaffected and still use chunked encoding.
+- HTTP/1.x performance improvements
+- The default `request_buffer_initial_len` is now 1024 bytes (previously 128), eliminating several
+  buffer reallocations while parsing a typical request head, for a negligible increase in
+  per-connection initial memory.
+- `response_header_initial_capacity` now defaults to 32 (was 16), and the request header map is
+  sized from the new `request_header_initial_capacity` (default 32). Both preallocate closer to a
+  typical request's header count, measurably reducing the work to build the header map for
+  header-heavy requests.
+
+## [1.3.8]
+
+The theme of this release is [RFC 9218 priority](https://datatracker.ietf.org/doc/rfc9218/) support.
+
+### Added
+
+- HTTP/2 responses are scheduled by client-signaled RFC 9218 priority — the `priority` request
+  header and `PRIORITY_UPDATE` frames. More urgent responses are written ahead of less urgent
+  ones; at equal urgency, responses the client marked incremental are interleaved frame-by-frame
+  while non-incremental ones are sent to completion one at a time.
+- `H3Connection::register_priority_callback` delivers RFC 9218 priority signals for HTTP/3 request
+  streams — each request's `priority` header and any subsequent `PRIORITY_UPDATE` — to the runtime
+  adapter that owns the QUIC streams, so it can apply them to the underlying send streams.
+- `H3Connection::process_inbound_bidi` returns a builder; attach a stream-reset hook with
+  `with_reset` and `.await` it to run the request/response cycle.
+
+## [1.3.7] - 2026-06-10
+
+The theme of this release is HTTP/1.x SHOULD-level conformance.
+
+### Changed
+
+- An HTTP/1.x request-line that can't be parsed returns a `400 Bad Request` instead of closing the
+  connection.
+- An HTTP/1.x request-target containing `#` or `\` is now rejected with `400 Bad Request`.
+- Leading empty lines before a HTTP/1.x request-line are now ignored.
+- An HTTP/1.x request carrying an `Expect` field-value other than `100-continue` is now answered
+  with `417 Expectation Failed` rather than silently ignored.
+
+## [1.3.6] - 2026-06-06
+
+The theme of this release is improved HTTP/2 flow control, informed by in-the-wild peer behavior.
+
+### Changed
+
+- The default HTTP/2 initial stream receive window (`HttpConfig::h2_initial_stream_window_size`) is
+  now 256 KiB, up from 0. A server accepts a request body up to this size on a newly-opened stream
+  before the handler starts reading it; the previous default of 0 required the client to wait for
+  the server to begin reading, which some peers never did, hanging the request. The window grows
+  to `h2_max_stream_recv_window_size` once the handler reads the body.
+- HTTP/2 receive flow control is now enforced strictly: a client that sends more request-body data
+  than the window it was granted is disconnected with a `FLOW_CONTROL_ERROR` (previously such
+  overruns were tolerated). If `h2_max_stream_recv_window_size` is configured below
+  `h2_initial_stream_window_size` it is raised to match it, with a warning logged.
+
+## [1.3.5] - 2026-06-05
+
+The theme of this release is protocol correctness / conformance, with a focus on http/1.x.
+
+### Added
+
+- `Headers::content_length()` parses the `Content-Length` header into an `Option<u64>`, accepting
+  only a single run of ASCII digits (rejecting a leading `+`/`-`, which `u64::from_str` would
+  otherwise accept, as well as multi-value, empty, and overflowing values). Prefer it over
+  `get_str(ContentLength).and_then(|c| c.parse().ok())`.
+
+### Changed
+
+- The HTTP/1.x request parser is now trillium's own implementation; the `httparse` dependency is
+  dropped and the `parse` cargo feature (which previously selected it) is retained as a no-op. The
+  new parser is stricter — it closes the conformance and security gaps below — but against
+  well-formed clients there is no observable difference.
+
+### Security
+
+- HTTP/1.x request smuggling: a malformed `Content-Length` was previously coerced to a zero-length
+  body, leaving the declared bytes unread in the buffer. Obs-fold header continuations, control
+  characters in header values and request targets, non-token header names, and malformed chunk
+  framing were also accepted. All are now rejected, closing request-smuggling and parser-differential
+  vectors.
+- HTTP/1.1 `Host`: a request with no `Host`, more than one, or a `Host` containing userinfo, a path,
+  whitespace, or other illegal content is now rejected rather than routed.
+
+### Fixed
+
+- Absolute-form request targets (`GET http://example.com/path`) now route correctly; previously the
+  entire URI was treated as the request path.
+- A request carrying both an authority (`:authority` or absolute-form) and a `Host` that differ only
+  by default port — e.g. `example.com:443` vs `example.com` — is no longer spuriously rejected; the
+  two are compared under scheme-based normalization (all three protocols).
+- A chunked request body terminated by a bare LF after the last chunk no longer hangs the connection.
+- Malformed HTTP/1.x requests now get a `400` (or `501` for an unrecognized method) before the
+  connection closes, instead of being dropped without a response. An unhandled `CONNECT` now defaults
+  to `501` rather than `404`.
+- A `Connection: close` token split across multiple `Connection` header lines now closes the
+  connection as requested; previously the multi-line value was missed and the connection was kept
+  alive.
+- HTTP/2 and HTTP/3 now reject a malformed `Content-Length` instead of coercing it to a body length:
+  a malformed request earns `RST_STREAM(PROTOCOL_ERROR)` (h2) / `H3_MESSAGE_ERROR` (h3), and a
+  malformed response on the client side earns `RST_STREAM(PROTOCOL_ERROR)` (h2). Previously such a
+  value was silently treated as "no declared length," skipping the content-length / DATA
+  cross-check.
+
+## [1.3.4] - 2026-06-02
+
+### Added
+
+- `Body` now supports `Arc<[u8]>` and `Arc<str>` fixed-length content via `From` conversions, for
+  cheaply-cloneable shared bodies that don't require `&'static` borrowing or per-send `Vec` clones.
+
+### Changed
+
+- Reduced per-response heap allocations across HTTP/1.x, HTTP/2, and HTTP/3, concentrated in
+  response-header encoding. Steady-state response encoding now allocates several fewer times per
+  HTTP/2 and HTTP/3 response. Behavior and public API are unchanged.
+
+## [1.3.3] - 2026-05-26
+
+### Fixed
+
+- HTTP/2: a received body that carried a `content-length` header could report end-of-input before
+  the stream's trailing headers arrived, so `request_trailers()` (server) / `response_trailers()`
+  (client) came back empty even though the peer had sent trailers. The effect was a timing-dependent
+  race condition. Bodies now wait for the end of the stream before reporting end-of-input, so the
+  trailers are always delivered.
+
+## [1.3.2] - 2026-05-24
+
+### Changed
+
+- All protocol versions: Previously, when upgrading on the client or server, outbound bodies were intentionally dropped. As of this release, content-length is stripped and any body that has been set is sent off before transitioning to upgrade.
+
+### Fixed
+
+- HTTP/2 server: a bidirectional or upgraded stream (such as a gRPC streaming RPC or a WebSocket-over-HTTP/2 connection) was torn down as soon as the client half-closed its request side, even while the server was still streaming the response. The rest of the response and any trailers were dropped, surfacing to the client as a stream reset or broken-pipe error. The server now keeps its response side open until the response completes. Relatedly, a handler's writes to a stream the client had reset mid-flight were silently discarded; they now report a broken-pipe error so the handler can stop.
+- HTTP/3: reading a body (request bodies in the server role, response bodies in the client role) could hang or fail with a spurious `UnexpectedEof` when the body's first DATA frame had been buffered alongside the headers and was then read with a buffer smaller than a frame header — as happens reading a body one byte at a time. Bodies read with a larger buffer, or whose body arrived separately from the headers, were unaffected. These now decode correctly.
+- HTTP/2 server: an idle extended-CONNECT (RFC 8441) upgrade — or any response whose body source is not yet ready to produce data — could busy-spin the connection, burning CPU and flooding logs with `drive` trace lines while waiting for the next write. The connection now sleeps until there is work to do.
+- HTTP/2 client: a request could hang forever when the connection closed without delivering a response — a graceful `GOAWAY`, a peer FIN, or an I/O error — unless the server had explicitly reset that stream. In-flight requests (awaiting response headers, reading a response body, or writing to an upgraded stream) now surface a connection-aborted / broken-pipe error instead of hanging.
+
+### Security
+
+- HTTP/2 server: a peer could exhaust server memory by opening a header block (a `HEADERS` frame without `END_HEADERS`) and then sending an unbounded stream of `CONTINUATION` frames without ever ending it — the "CONTINUATION flood" (CVE-2024-27316 class). The cumulative compressed header block is now bounded by the advertised `SETTINGS_MAX_HEADER_LIST_SIZE` (`HttpConfig::max_header_list_size`, default 32 KiB); a block exceeding it closes the connection with `GOAWAY(ENHANCE_YOUR_CALM)` before decoding.
+- HTTP/2: a message whose `content-length` header disagreed with the actual length of its body was accepted rather than rejected — on the server for request bodies, and on the client for response bodies. A body longer than declared was silently truncated at the declared length; a shorter one was only caught if the body happened to be read to its end. The gap between a declared and actual body length is a request/response-smuggling / desync primitive, most concretely when the message is forwarded to an HTTP/1 peer whose parser trusts `content-length`. Both directions are now rejected with a stream error: a body that overruns its declared length the moment it does so, and a short one when the stream ends.
+
+## [1.3.1] - 2026-05-21
+
+### Fixed
+
+- HTTP/2 server: an HTTP/2 response could end with a stream reset instead of its trailing headers when the client hadn't finished sending its request before the response completed. Under load this dropped trailers. The server now waits for the client to finish its half of the stream before closing, so the trailers arrive intact.
+
+## [1.3.0] - 2026-05-21
+
+### Added
+
+- `Upgrade::send_trailers(self, &Headers) -> io::Result<()>` — emit trailing headers and finish the outbound stream. On HTTP/1.1 with `Transfer-Encoding: chunked` set on the response, writes the last-chunk marker, trailer section, and final CRLF, then closes the transport. On HTTP/2, enqueues a trailing `HEADERS` frame with `END_STREAM` via the connection driver. On HTTP/3, encodes a trailing `HEADERS` frame via QPACK and closes the stream. On HTTP/1.x without chunked framing trailers are dropped with a `log::warn!`.
+- `Upgrade::received_trailers() -> Option<&Headers>` (with `_mut` and `take_` variants) — inbound trailers carried across the upgrade transition or decoded by the post-upgrade inbound state machine.
+
+### Changed
+
+- `Upgrade::request_headers` and associated accessors are deprecated in preference to `Upgrade::received_headers`
+- `Upgrade::response_headers` and associated accessors are deprecated in preference to `Upgrade::sent_headers`
+
+### Fixed
+
+- HTTP/2 requests did not prevent graceful shutdown. Now they do.
+- The `AsyncWrite`/`AsyncRead` implementations on `Upgrade` now correctly applies per-protocol framing/deframing instead of raw passthrough. Previously, only HTTP/2 applied framing. Now, HTTP/1.1 with `Transfer-Encoding: chunked` headers encodes/decodes appropriate chunk framing, and HTTP/3 encodes/decodes DATA framing. HTTP/1.x without `Transfer-Encoding: Chunked` continues to pass through transparently.
+- Reading an HTTP/1.1 chunked-encoded body — request bodies in the server role, response bodies in the client role — could in rare cases fail to decode despite the wire being well-formed, surfacing as one of `chunk header too long`, `invalid chunk size`, `ConnectionAborted`, or `UnexpectedEof`. The triggers all sat at the intersection of partial chunk-size headers (caused by transport segmentation landing inside the few-byte chunk-size header window) and content already buffered for processing (either residual from the conn's pre-read scratch, or partial header bytes stashed by a prior poll). Well-behaved clients use sensible chunk sizes, and reverse proxies typically re-frame chunked bodies before forwarding to the backend, so traffic in typical deployments was very unlikely to hit any of these. Decode errors are now surfaced only for genuinely malformed bodies or actual transport closure. Outbound chunked encoding (the write path in either role) was never affected.
+- Client-role responses from HTTP/1.0 servers that omit `Content-Length` (read-to-close framing) now decode correctly. Previously these surfaced as chunked-decode errors because the inbound body was routed through the chunked decoder.
+
+## [1.2.2] - 2026-05-15
+
+### Added
+
+- `Error::Other` and the `Error::other(impl Error)` constructor — a catchall variant for application-level errors that need to flow through `trillium_http::Result`.
+- `KnownHeaderName::CdnCacheControl`
+
+### Changed
+
+- `From<ReceivedBody<'static, _>> for Body` now propagates trailers from
+  the source body through the conversion. Behavior change for the
+  trailer-carrying case; equivalent for bodies without trailers.
+
+## [1.2.1] - 2026-05-11
+
+### Fixed
+
+- HTTP/2 client: interim 1xx HEADERS frames (early hints, etc.) are now discarded instead of being latched as the final response. Per RFC 9113 §8.1 a response may include zero or more informational HEADERS before the final, and per RFC 9110 §15.2 / RFC 8297 §2 their headers must not be merged into the final. `101 Switching Protocols` continues to be treated as a final response. An interim HEADERS frame that erroneously carries `END_STREAM` now surfaces `ConnectionAborted` to the conn task instead of hanging.
+
+## [1.2.0] - 2026-05-07
+
+### Added
+
+- `H3Connection::process_inbound_bidi_with_reset` — process a bidi request stream with a caller-supplied closure that issues `RESET_STREAM` on stream-level protocol errors, as required by RFC 9114 §4.1.2.
+- `H3Connection::process_inbound_uni_with_close` — process a uni stream with a caller-supplied closure that fires `CONNECTION_CLOSE` while the recv stream is still alive, avoiding a `FINAL_SIZE_ERROR` race with the peer's response to STOP_SENDING.
+
+### Deprecated
+
+- `H3Connection::process_inbound_bidi` — use `process_inbound_bidi_with_reset` instead.
+- `H3Connection::process_inbound_uni` — use `process_inbound_uni_with_close` instead.
+
+### Fixed
+
+[h3spec](https://github.com/kazu-yamamoto/h3spec) identified the following minor violations in trillium's h3 implementation, primarily focused on error handling. All of these are fixed in 1.2.0:
+
+- RFC 9114 §4.1.2 — stream-level errors (notably `H3_MESSAGE_ERROR`) MUST RST the bidi stream.
+- RFC 9114 §4.1.1 / §4.2 / §4.3.1 — malformed messages (duplicated pseudos, unknown pseudos, uppercase header bytes) are `H3_MESSAGE_ERROR`.
+- RFC 9114 §4.3.1 — schemes with mandatory authority component (http/https) require `:authority` or `Host` on non-`CONNECT` requests.
+- RFC 9114 §6.2.1 — first frame on the peer's control stream must be `SETTINGS`. Non-`SETTINGS` first frame OR a malformed first frame →
+  `H3_MISSING_SETTINGS`.
+- RFC 9114 §6.2.1 + RFC 9204 §4.2 — closure of control or QPACK streams is `H3_CLOSED_CRITICAL_STREAM`.
+- RFC 9114 §7.2.1 / §7.2.2 / §7.2.4 / §7.2.5 — control stream must reject `DATA`, `HEADERS`, `PUSH_PROMISE`, second `SETTINGS`, and the WebTransport
+  `0x41` signal as `H3_FRAME_UNEXPECTED`.
+- RFC 9114 §4.1 — first-frame decode failure on a request bidi stream is `H3_FRAME_UNEXPECTED`.
+- RFC 9204 §3.1 — invalid static-table index in a field-line representation is `QPACK_DECOMPRESSION_FAILED`.
+- RFC 9204 §4.1.3 — Set Dynamic Table Capacity exceeding the limit is `QPACK_ENCODER_STREAM_ERROR`.
+- RFC 9204 §4.4.3 — Insert Count Increment of 0 is `QPACK_DECODER_STREAM_ERROR`.
+- RFC 9204 §6 — QPACK errors are connection-level, not stream-level.
+- RFC 9114 §8.1 / RFC 9204 §6 — correct close error code on the wire.
+
+## [1.1.0] - 2026-05-05
+
+This release adds http/2 support.
+
+### Added
+- `pub mod h2` — HTTP/2 protocol primitives: HPACK encode/decode, h2 framing, `H2Connection`, `H2Driver`, `H2Transport`. HTTP/2 is automatically negotiated when ALPN selects `h2` or via prior-knowledge cleartext ("h2c"). 146/146 [h2spec](https://github.com/summerwind/h2spec) cases pass.
+- HTTP/2 extended CONNECT (RFC 8441) — opt in via `HttpConfig::with_extended_connect_enabled()`; required for WebSockets-over-h2.
+- `KnownHeaderName::Refresh`
+- `Conn::h2_connection()`, `Conn::h2_stream_id()`, `Conn::h3_stream_id()` — for handlers that want to interact with the underlying h2/h3 stream
+- `Upgrade::h2_connection`, `Upgrade::h2_stream_id`, `Upgrade::h3_stream_id` (and `_mut` / `set_` / `with_` / `take_` variants where applicable) — used by `trillium-websockets` for WS-over-h2 (RFC 8441)
+- Various `HttpConfig::h2_*` tuning knobs: `h2_initial_connection_window_size`, `h2_initial_stream_window_size`, `h2_max_stream_recv_window_size`, `h2_max_concurrent_streams`, `h2_max_frame_size`
+- `HttpConfig::dynamic_table_capacity` (and setter / `with_` / `_mut` variants) — HPACK/QPACK encoder dynamic table capacity, shared between h2 and h3
+- `HttpConfig::recent_pairs_size` (and setter / `with_` / `_mut` variants) — per-connection ring size for the HPACK/QPACK encoder's recent-pairs predictor
+- `HttpConfig::h3_blocked_streams` (and setter / `with_` / `_mut` variants) — maximum number of HTTP/3 streams that may be blocked waiting for QPACK dynamic-table updates
+- `Upgrade::response_headers: Headers` — the response headers that had been set on the underlying `Conn` before the upgrade was negotiated. These have already been sent to the peer; preserved here so post-upgrade code can inspect what was sent. `response_headers_mut`, `set_response_headers`, `with_response_headers`, and `into_response_headers` round out the accessor surface.
+- `Upgrade::status` (with `_mut` / `set_` / `take_` / `with_` variants) — `Option<Status>` carrying the response status sent before the upgrade
+- `Upgrade::start_time` (with `_mut` / `set_` / `with_` variants) — `Instant` recording when the Conn that became this Upgrade was constructed
+- `H3Connection::peer_settings_ready() -> PeerSettingsReady<'_>` (gated on the `unstable` feature) — async future that resolves to `Some(H3Settings)` once the inbound control stream has applied the peer's SETTINGS frame, or `None` if the connection shut down before SETTINGS arrived. Required for senders of extended-CONNECT requests (RFC 9220 §3 — the spec forbids sending a `:protocol` HEADERS until the peer has advertised `SETTINGS_ENABLE_CONNECT_PROTOCOL`). On a pooled connection that has already exchanged SETTINGS, the future resolves on the first poll. Multiple awaiters on the same connection are supported.
+
+The existing sync `H3Connection::peer_settings(&self) -> Option<&H3Settings>` accessor is unchanged.
+
+## [1.0.0] - 2026-05-02
+
+### Changed
+- Compatible with trillium 1.0
+- `StateSet` renamed to `TypeSet` and extracted to the [`type-set`](https://docs.rs/type-set) crate; re-exported as `trillium_http::TypeSet`
+- Trillium 1.0 uses [Swansong](https://docs.rs/swansong) instead of Stopper; `Conn::stopper()` → `Conn::swansong()`
+- `Error` variants renamed for consistency: `MalformedHeader` → `InvalidHeaderValue`, `PartialHead` → `InvalidHead`, `MissingVersion` → `InvalidVersion`, `UnrecognizedStatusCode`/`MissingStatusCode` → `InvalidStatus`/`MissingStatus`; `HeaderMissing` and `UnexpectedHeader` now carry `HeaderName<'static>` instead of `&'static str`; `UnsupportedVersion` now carries `Version` instead of `u8`
+- `Version::Http2_0` renamed to `Version::Http2`; `Version::Http3_0` renamed to `Version::Http3`
+- `Upgrade` is now `#[non_exhaustive]`; `Upgrade::buffer` changed from `Option<Vec<u8>>` to `Buffer`; `Upgrade::stopper` renamed to `Upgrade::swansong`; `Upgrade::peer_ip: Option<IpAddr>` added
+- `ReceivedBody` no longer implements `Stream`; use `AsyncRead` instead
+- `Headers::contains_ignore_ascii_case` removed (was deprecated)
+- `Headers::append` and `Headers::try_insert_with` now return `&mut HeaderValues` instead of `()`
+- `set_*` setters on `Conn` (e.g. `set_status`, `set_host`) now return `&mut Self`, enabling chaining
+- Handler futures in `Conn::map` and friends no longer require `Send`
+- `pub mod transport` removed — the `Transport` trait is now at `trillium::Transport`
+- `Body::new_streaming` no longer requires a `Sync` reader.
+- `Conn::request_body` is synchronous now. 100-continue is sent, if necessary, on first read from the body.
+- `ReceivedBody` no longer implements `IntoFuture` to make the transition to request_body being synchronous easier.
+
+### Added
+- `Headers::entry()` — Entry API for inserting/modifying headers, mirroring `HashMap::entry`
+- `parse` feature — opt-in alternative header parser (bypasses httparse; groundwork for H3)
+- `HttpContext` is now public — Arc-shared per-server state (Swansong + TypeSet + HttpConfig) passed to every connection
+- `pub mod h3` — HTTP/3 protocol primitives: QPACK encode/decode, H3 framing, `H3Connection`, `H3Body`, `H3Error`; used by [`trillium-quinn`](https://docs.rs/trillium-quinn) and other QUIC adapter crates
+
+## [0.3.16](https://github.com/trillium-rs/trillium/compare/trillium-http-v0.3.15...trillium-http-v0.3.16) - 2024-04-07
+
+### Added
+- add deprecation warnings to 0.2 branch in preparation for 0.3
+
+### Fixed
+- remove unreleased Upgrade::request_headers and Upgrade::request_headers_mut
+- *(trillium)* fix the flaky liveness test
+
+## [0.3.15](https://github.com/trillium-rs/trillium/compare/trillium-http-v0.3.14...trillium-http-v0.3.15) - 2024-03-22
+
+### Added
+- *(http)* sort Host and Date headers first
+- *(test)* add corpus tests
+
+### Other
+- clippy
+- *(http)* document addition of is_valid
+
+## [0.3.14](https://github.com/trillium-rs/trillium/compare/trillium-http-v0.3.13...trillium-http-v0.3.14) - 2024-02-08
+
+### Added
+- *(http)* add the notion of closure to synthetic bodies
+
+### Fixed
+- *(http)* fix Conn::is_disconnected logic
+- *(http)* fix synthetic body AsyncRead implementation for large bodies
+
+## [0.3.13](https://github.com/trillium-rs/trillium/compare/trillium-http-v0.3.12...trillium-http-v0.3.13) - 2024-02-05
+
+### Added
+- *(http)* fix http-compat cargo feature specification
+- *(http)* relax handler constraint to be FnMut instead of Fn
+- *(http)* cancel on disconnect
+
+### Other
+- *(http)* appease the clipmaster
+
+## [0.3.12](https://github.com/trillium-rs/trillium/compare/trillium-http-v0.3.11...trillium-http-v0.3.12) - 2024-01-24
+
+### Fixed
+- *(security)* allow all tchar in header names
+- *(security)* handling of unsafe characters in outbound header names and values
+
+### Other
+- *(deps)* update env_logger requirement from 0.10.1 to 0.11.0
+
+## [0.3.11](https://github.com/trillium-rs/trillium/compare/trillium-http-v0.3.10...trillium-http-v0.3.11) - 2024-01-02
+
+### Other
+- use #[test(harness)] instead of #[test(harness = harness)]
+- Update test-harness requirement from 0.1.1 to 0.2.0
+
+## [0.3.10](https://github.com/trillium-rs/trillium/compare/trillium-http-v0.3.9...trillium-http-v0.3.10) - 2024-01-02
+
+### Other
+- Update smol requirement from 1.3.0 to 2.0.0
+- update dependencies other than trillium-rustls
+- http patch reversion: set Server header before request again
+- http patch feature: serde for version
+- http patch: don't send explicit connection: keep-alive

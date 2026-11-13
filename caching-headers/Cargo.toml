@@ -1,0 +1,20 @@
+[package]
+name = "trillium-caching-headers"
+version = "0.4.3"
+edition = "2024"
+description = "http caching headers for trillium.rs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/trillium-rs/trillium"
+readme = "README.md"
+keywords = ["trillium", "framework", "async"]
+categories = ["web-programming::http-server", "web-programming"]
+
+[dependencies]
+etag = { version = "4.0.0", features = ["std"] }
+httpdate = "1.0.3"
+trillium.workspace = true
+
+[dev-dependencies]
+trillium-smol = { path = "../smol" }
+trillium-static = { path = "../static", features = ["smol"] }
+trillium-testing = { path = "../testing" }

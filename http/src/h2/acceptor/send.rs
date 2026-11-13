@@ -1,0 +1,852 @@
+//! Send pump: drains each stream's [`OutboundPart`] queue into HEADERS / DATA / trailing-HEADERS /
+//! `RST_STREAM` frame bytes in `H2Driver.write_buf`, and signals completion back to the conn task
+//! once the submitted message is fully framed.
+//!
+//! Each stream's conn-task-staged parts are picked up into a driver-private [`SendCursor`] in the
+//! parent's `service_handler_signals`. Per tick, `advance_outbound_sends` frames each cursor's
+//! work: an owned [`OutboundPart::Body`] is framed directly under flow control; streaming bytes a
+//! handler wrote through [`H2Transport`][super::super::transport::H2Transport] flow through the
+//! per-stream `outbound` ring, which is drained before any terminator. HEADERS blocks emit to
+//! `END_HEADERS` without yielding to other streams (§6.10).
+//!
+//! All methods are on [`super::H2Driver`].
+
+use super::{ClosedReason, DriverState, H2Driver, Role};
+use crate::{
+    h2::{
+        H2Body, H2ErrorCode, frame,
+        stream_state::StreamEvent,
+        transport::{OutboundPart, StreamState},
+    },
+    headers::hpack::{FieldSection, PseudoHeaders},
+};
+use futures_lite::io::{AsyncRead, AsyncWrite};
+use std::{
+    collections::VecDeque,
+    io,
+    pin::Pin,
+    sync::{Arc, atomic::Ordering},
+    task::{Context, Poll},
+};
+
+/// Driver-private state for an in-progress send on a single stream. Never observed concurrently —
+/// only the driver task touches this.
+///
+/// The conn task's staged [`OutboundPart`]s are drained into `parts`; the driver frames them in
+/// order. A [`OutboundPart::Body`] becomes the in-progress `body` (framed across ticks under flow
+/// control); everything else frames atomically. Streaming bytes from an upgrade handler don't pass
+/// through here — they're in the shared `outbound` ring, drained before a terminator.
+#[derive(Debug, Default)]
+pub(super) struct SendCursor {
+    /// Parts drained from the shared `send.queue`, framed front-to-back.
+    parts: VecDeque<OutboundPart>,
+    /// The current owned body being framed, if any. `None` between parts.
+    body: Option<H2Body>,
+    /// Declared `Body::len` for the in-progress body, captured before `into_h2` consumed it. When
+    /// `Some(n)` and `body_emitted == n` we transition out of the body without another `poll_read`
+    /// — important when the send window is exactly at zero on the last byte.
+    body_declared_len: Option<u64>,
+    /// Cumulative DATA payload bytes emitted from the in-progress body.
+    body_emitted: u64,
+    /// `true` when the last frame attempt couldn't make progress without an external wake (body
+    /// `poll_read` returned `Pending`, the ring is empty awaiting a handler write, or a window is
+    /// exhausted). Read by [`H2Driver::has_pending_outbound_progress`] so the driver parks instead
+    /// of busy-looping; cleared whenever a frame is emitted or framable parts remain.
+    parked: bool,
+}
+
+/// One stream's entry in the send pump's priority schedule. The field order is load-bearing: the
+/// derived [`Ord`] sorts by urgency (0 = most urgent first), then non-incremental before
+/// incremental at equal urgency, then ascending stream id — which is exactly the scheduling order
+/// [`advance_outbound_sends`][H2Driver::advance_outbound_sends] walks.
+///
+/// The stream-id tiebreak is also what puts a client's opening HEADERS on the wire in
+/// monotonically increasing stream-id order, as RFC 9113 §5.1.1 requires: client streams all
+/// carry the default priority. A higher id framed first would draw a `GOAWAY(PROTOCOL_ERROR)`
+/// from the peer. (See also the allocate-under-`streams_lock` ordering in `open_stream`.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct ScheduleEntry {
+    urgency: u8,
+    incremental: bool,
+    stream_id: u32,
+}
+
+/// Outcome of one [`H2Driver::step_stream_send`] step, telling the priority pump whether to keep
+/// pushing this stream (run-to-completion / round-robin) or move on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainOutcome {
+    /// Emitted a DATA frame; the stream may have more to send.
+    Progressed,
+    /// Parked on an external wake (a send window or the body source). The stream's own waker will
+    /// re-drive the pump; the scheduler drops it from this tick's rotation.
+    Stalled,
+    /// Finalized, reset, removed, or out of work — nothing more to do this stream.
+    Done,
+}
+
+impl SendCursor {
+    /// `true` if there is no more send work staged — the queue is drained and no body is in
+    /// flight. (Streaming-ring state is checked separately by the driver.)
+    fn is_idle(&self) -> bool {
+        self.parts.is_empty() && self.body.is_none()
+    }
+
+    /// Stage one part drained from the shared queue. A [`OutboundPart::Reset`] preempts: it
+    /// abandons any parts still staged and any body mid-frame, since nothing else is valid to send
+    /// once we're resetting — so a `stream_error` raised after the driver already picked up a
+    /// response still resets the stream rather than framing the stale response first.
+    pub(super) fn stage_part(&mut self, part: OutboundPart) {
+        if matches!(part, OutboundPart::Reset(_)) {
+            self.parts.clear();
+            self.body = None;
+            self.body_declared_len = None;
+            self.body_emitted = 0;
+        }
+        self.parts.push_back(part);
+    }
+
+    /// The in-progress body has drained. Drop it, and if it carried trailers, splice them in as the
+    /// terminator (replacing a trailing bare `Close`), so a body's `grpc-status`-style trailers
+    /// frame as trailing HEADERS rather than an empty `DATA(END_STREAM)`.
+    fn drain_body_into_trailers(&mut self) -> io::Result<()> {
+        let trailers = self
+            .body
+            .as_mut()
+            .map(H2Body::trailers)
+            .transpose()?
+            .flatten();
+        self.body = None;
+        if let Some(trailers) = trailers {
+            if matches!(self.parts.front(), Some(OutboundPart::Close)) {
+                self.parts.pop_front();
+            }
+            self.parts.push_front(OutboundPart::Trailers(trailers));
+        }
+        Ok(())
+    }
+}
+
+impl<T> H2Driver<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    /// Pump outbound bytes, applying RFC 9218 priority. Two passes over the streams holding a send
+    /// cursor (`sending_streams`):
+    ///
+    /// 1. **Response-start headers** — emit every stream's pending leading HEADERS block (via
+    ///    [`Self::advance_send_headers`]). HEADERS consume no flow-control window, so getting them
+    ///    onto the wire ahead of the body pass never steals bandwidth from a higher-priority body;
+    ///    it just keeps a low-priority response's *start* from queuing behind an urgent stream's
+    ///    bytes. (HEADERS blocks emit atomically — the spec forbids interleaving HEADERS +
+    ///    CONTINUATION with any other frame on any stream.)
+    ///
+    /// 2. **Body bandwidth** — drain DATA in priority order. Streams are scheduled by urgency (0 =
+    ///    most urgent first); within an urgency, non-incremental streams (RFC 9218 `i=?0`) sort
+    ///    ahead of incremental ones. A non-incremental stream drains to completion — one stream
+    ///    fully before the next is touched — which both honors "more urgent finishes first" and
+    ///    produces large contiguous frames. Incremental streams at the same urgency round-robin one
+    ///    frame each ([`Self::round_robin_incremental`]).
+    ///
+    /// The "don't leave bandwidth idle" rule falls out of the existing flow-control budget: a
+    /// *per-stream* window stall only blocks that one stream (the walk proceeds to lower-priority
+    /// streams), while
+    /// *connection* window exhaustion stalls everyone — which is correct, since there's then no
+    /// bandwidth left to reallocate.
+    ///
+    /// Body / ring reads that return `Pending` leave the cursor in place; their source wakes the
+    /// driver task.
+    ///
+    /// No-op outside [`DriverState::Running`] / [`DriverState::Closing`]: in earlier states the
+    /// preface and our initial SETTINGS haven't reached the wire. After `begin_close` queues
+    /// GOAWAY, in-flight streams must still be able to emit DATA / trailers / `END_STREAM` (the
+    /// spec allows frames for streams at or below the advertised last-stream-id, and late trailers
+    /// from a gRPC cancellation race land after `begin_close`).
+    pub(super) fn advance_outbound_sends(&mut self, cx: &mut Context<'_>) {
+        if !matches!(self.state, DriverState::Running | DriverState::Closing) {
+            return;
+        }
+
+        // Build the priority schedule once and use it for both passes. Computed before pass 1, but
+        // pass 1 only emits HEADERS (it never changes a stream's priority), so the order stays
+        // valid; a bodyless stream pass 1 finalizes is simply a no-op when pass 2 reaches it.
+        // `send_schedule` is owned scratch — take it out so the per-stream `&mut self` calls below
+        // don't conflict with borrowing it, then restore it for reuse.
+        let mut schedule = std::mem::take(&mut self.send_schedule);
+        schedule.clear();
+        schedule.extend(self.sending_streams.iter().map(|&stream_id| {
+            let priority = self.effective_priority(stream_id);
+            ScheduleEntry {
+                urgency: priority.urgency(),
+                incremental: priority.is_incremental(),
+                stream_id,
+            }
+        }));
+        schedule.sort_unstable();
+
+        // Only worth logging when streams actually contend — a single stream has nothing to order.
+        if schedule.len() > 1 {
+            log::trace!("h2 send schedule (priority order): {schedule:?}");
+        }
+
+        // Pass 1: response-start headers, in schedule order.
+        for entry in &schedule {
+            self.advance_send_headers(entry.stream_id);
+        }
+
+        // Pass 2: body bandwidth in priority order.
+        let mut index = 0;
+        while index < schedule.len() {
+            let entry = schedule[index];
+            if entry.incremental {
+                // All same-urgency entries from here are incremental (non-incremental sort first),
+                // so the contiguous run is exactly this urgency's incremental streams.
+                let start = index;
+                while index < schedule.len() && schedule[index].urgency == entry.urgency {
+                    index += 1;
+                }
+                let group = schedule[start..index].iter().map(|e| e.stream_id).collect();
+                self.round_robin_incremental(group, cx);
+            } else {
+                // Non-incremental: drain this stream to completion before the next.
+                while self.step_stream_send(entry.stream_id, cx) == DrainOutcome::Progressed {}
+                index += 1;
+            }
+        }
+
+        self.send_schedule = schedule;
+        self.sending_streams.retain(|id| {
+            self.streams
+                .get(id)
+                .is_some_and(|entry| entry.send.is_some())
+        });
+    }
+
+    /// Round-robin one DATA frame at a time across a set of same-urgency incremental streams,
+    /// dropping each from the rotation as it stalls (needs a wake) or completes, until none can
+    /// make progress. This is the RFC 9218 `i=?1` interleaving: equal-urgency incremental
+    /// responses share bandwidth frame-by-frame rather than draining one at a time.
+    fn round_robin_incremental(&mut self, mut active: VecDeque<u32>, cx: &mut Context<'_>) {
+        while let Some(stream_id) = active.pop_front() {
+            if self.step_stream_send(stream_id, cx) == DrainOutcome::Progressed {
+                active.push_back(stream_id); // more to send — rotate to the back for fairness
+            }
+        }
+    }
+
+    /// True if any stream has send work in flight — a cursor with staged parts or an in-progress
+    /// body, or parts staged by the conn task that the driver hasn't picked up yet. Used to defer
+    /// `Closing → Drained` until every active stream has emitted its terminator.
+    pub(super) fn has_active_send_cursors(&self) -> bool {
+        self.streams.values().any(|e| {
+            e.send.as_ref().is_some_and(|c| !c.is_idle())
+                || !e
+                    .shared
+                    .send
+                    .queue
+                    .lock()
+                    .expect("send queue mutex poisoned")
+                    .is_empty()
+        })
+    }
+
+    /// True if any stream's recv half hasn't observed `END_STREAM` yet (peer might still send DATA
+    /// or trailing HEADERS). Used by the `Closing → Drained` transition to keep the recv pump
+    /// running for in-flight streams after GOAWAY.
+    pub(super) fn has_pending_recv(&self) -> bool {
+        self.streams
+            .values()
+            .any(|e| !e.shared.lifecycle_lock().recv_closed())
+    }
+
+    /// True if any stream's send half is still open — the half-closed-remote case is a server
+    /// handler that has received the full request but not yet submitted its response. Such a
+    /// stream has no send cursor or queued parts yet, so [`Self::has_active_send_cursors`] reads it
+    /// as idle; but draining and finishing the driver here would strand the response the handler is
+    /// about to submit — its `SubmitSend` would never be framed or resolved, hanging the handler
+    /// task (and any graceful-shutdown guard it holds). Hold the drain until the send half closes,
+    /// which happens when the handler responds (`END_STREAM`) or abandons the stream
+    /// (`RST_STREAM`).
+    pub(super) fn has_open_send_half(&self) -> bool {
+        self.streams
+            .values()
+            .any(|e| !e.shared.lifecycle_lock().send_closed())
+    }
+
+    /// True if any active stream could emit a frame on the next tick without an external wake.
+    ///
+    /// This is the recheck `park` makes *after* registering its waker, so it must be exact:
+    /// - A cursor parked on a wake it registered itself (body `poll_read` `Pending`, or a window
+    ///   exhausted — resumed by the body waker or a peer `WINDOW_UPDATE`) is excluded.
+    /// - A cursor with staged parts or an in-progress body has framable work.
+    /// - An otherwise-idle cursor is checked against the streaming ring: bytes there (whether left
+    ///   from a window-limited drain or just appended by a racing `poll_write`) are framable, and
+    ///   omitting this check is exactly the missed-wake that hangs an idle bidi tunnel.
+    pub(super) fn has_pending_outbound_progress(&self) -> bool {
+        if self.connection_send_window <= 0 {
+            return false;
+        }
+        self.sending_streams
+            .iter()
+            .filter_map(|id| self.streams.get(id))
+            .any(|entry| {
+                let Some(cursor) = &entry.send else {
+                    return false;
+                };
+                if cursor.parked {
+                    return false;
+                }
+                if !cursor.is_idle() {
+                    return true;
+                }
+                // Only the streaming ring could still hold framable bytes.
+                entry.send_window > 0
+                    && !entry
+                        .shared
+                        .send
+                        .outbound
+                        .lock()
+                        .expect("outbound mutex poisoned")
+                        .is_empty()
+            })
+    }
+
+    /// Pass 1 of the send pump: emit any pending leading response HEADERS for one stream, then stop
+    /// at the body. See [`Self::advance_outbound_sends`] for why headers go out ahead of the
+    /// priority-ordered body pass. A bodyless response (HEADERS immediately followed by `Close`)
+    /// finalizes here — it frames no DATA, so there is nothing for the body pass to schedule.
+    fn advance_send_headers(&mut self, stream_id: u32) {
+        let Some(mut cursor) = self.streams.get_mut(&stream_id).and_then(|e| e.send.take()) else {
+            return;
+        };
+        // A response stages a single leading HEADERS block, but interim (1xx) responses can stack
+        // several; loop and re-check rather than assume exactly one.
+        while matches!(cursor.parts.front(), Some(OutboundPart::Headers { .. })) {
+            if self.emit_leading_headers_part(stream_id, &mut cursor) {
+                return; // finalized (bodyless): the entry is torn down or its send is complete
+            }
+        }
+        if let Some(entry) = self.streams.get_mut(&stream_id) {
+            entry.send = Some(cursor);
+        }
+    }
+
+    /// Emit one leading HEADERS block (a response, or a client-role request) off the front of the
+    /// cursor (caller has confirmed the front is `Headers`). Folds `END_STREAM` onto it when a bare
+    /// `Close` immediately follows (no body), finalizing the stream in that case. Returns `true` if
+    /// it finalized.
+    fn emit_leading_headers_part(&mut self, stream_id: u32, cursor: &mut SendCursor) -> bool {
+        let Some(OutboundPart::Headers { pseudos, headers }) = cursor.parts.pop_front() else {
+            return false;
+        };
+        let end_stream = matches!(cursor.parts.front(), Some(OutboundPart::Close));
+        if end_stream {
+            cursor.parts.pop_front();
+        }
+        self.emit_headers_block(stream_id, &FieldSection::new(pseudos, &headers), end_stream);
+        if self.role == Role::Client {
+            self.last_local_stream_id = self.last_local_stream_id.max(stream_id);
+        }
+        // Release our share before completing the send: the conn task takes its headers back
+        // as soon as it observes completion, and copies them if this share is still alive.
+        drop(headers);
+        self.feed_send(stream_id, StreamEvent::SendHeaders { end_stream });
+        if end_stream {
+            self.finalize_send(stream_id);
+        }
+        end_stream
+    }
+
+    /// Pass 2 of the send pump: advance one stream's body/ring/terminator by a single step, framing
+    /// at most one DATA frame. Returns whether more work might remain ([`DrainOutcome`]):
+    /// [`Progressed`][DrainOutcome::Progressed] when a DATA frame was emitted (the caller may step
+    /// again to run a non-incremental stream to completion, or rotate for round-robin),
+    /// [`Stalled`][DrainOutcome::Stalled] when it parked on a window or body-source wake, and
+    /// [`Done`][DrainOutcome::Done] when the stream finalized, reset, or has no work left. Drains
+    /// the streaming ring before any terminator. Returns the cursor to the entry unless the stream
+    /// completed or reset (in which case it's dropped).
+    fn step_stream_send(&mut self, stream_id: u32, cx: &mut Context<'_>) -> DrainOutcome {
+        let Some(mut cursor) = self.streams.get_mut(&stream_id).and_then(|e| e.send.take()) else {
+            return DrainOutcome::Done;
+        };
+        cursor.parked = false;
+
+        let outcome = loop {
+            // Continue an in-progress body before looking at the next part.
+            if cursor.body.is_some() {
+                match self.poll_emit_body(stream_id, &mut cursor, cx) {
+                    Poll::Ready(Ok(true)) => continue, // body drained; on to the next part
+                    Poll::Ready(Ok(false)) => break DrainOutcome::Progressed, // emitted a chunk
+                    Poll::Ready(Err(e)) => {
+                        self.complete_and_remove_stream(stream_id, Err(e));
+                        return DrainOutcome::Done;
+                    }
+                    Poll::Pending => {
+                        cursor.parked = true;
+                        break DrainOutcome::Stalled;
+                    }
+                }
+            }
+
+            let front_terminal = cursor.parts.front().is_some_and(OutboundPart::is_terminal);
+            let send_open = !self.lifecycle_send_closed(stream_id);
+
+            // Drain the streaming ring before a terminator, and while the queue is empty but the
+            // send half is still open (a bidi tunnel awaiting handler writes).
+            if send_open && (front_terminal || cursor.parts.is_empty()) {
+                match self.poll_emit_ring(stream_id) {
+                    Poll::Ready(true) => { /* ring empty; fall through */ }
+
+                    Poll::Ready(false) => {
+                        // emitted a ring chunk
+                        break DrainOutcome::Progressed;
+                    }
+
+                    Poll::Pending => {
+                        cursor.parked = true;
+                        break DrainOutcome::Stalled;
+                    }
+                }
+            }
+
+            let Some(part) = cursor.parts.pop_front() else {
+                // Queue drained (and the ring is empty — checked above). Resolve the submit future
+                // (END_STREAM for a normal response, the prelude handoff for a bidi upgrade). Don't
+                // set `parked`: an idle bidi tunnel must stay wakeable by `poll_write`, which
+                // `has_pending_outbound_progress` detects via the ring.
+                self.resolve_submit_send(stream_id, Ok(()));
+                break DrainOutcome::Done;
+            };
+
+            match part {
+                OutboundPart::Headers { pseudos, headers } => {
+                    // Pass 1 drains all leading HEADERS, so one reaching the body pass is a logic
+                    // error. Re-stage and emit it rather than dropping the response.
+                    debug_assert!(false, "HEADERS part reached the h2 body send pass");
+                    cursor
+                        .parts
+                        .push_front(OutboundPart::Headers { pseudos, headers });
+                    if self.emit_leading_headers_part(stream_id, &mut cursor) {
+                        return DrainOutcome::Done;
+                    }
+                }
+                OutboundPart::Body(body) => {
+                    cursor.body_declared_len = body.len();
+                    cursor.body_emitted = 0;
+                    cursor.body = Some(body);
+                }
+                OutboundPart::Trailers(trailers) => {
+                    self.emit_headers_block(
+                        stream_id,
+                        &FieldSection::new(PseudoHeaders::default(), &trailers),
+                        true,
+                    );
+                    self.feed_send(stream_id, StreamEvent::SendHeaders { end_stream: true });
+                    self.finalize_send(stream_id);
+                    return DrainOutcome::Done;
+                }
+                OutboundPart::Close => {
+                    self.emit_empty_end_stream(stream_id);
+                    self.feed_send(stream_id, StreamEvent::SendData { end_stream: true });
+                    self.finalize_send(stream_id);
+                    return DrainOutcome::Done;
+                }
+                OutboundPart::Reset(code) => {
+                    log::debug!("h2 stream {stream_id}: conn-task-requested RST_STREAM({code:?})");
+                    // `queue_rst_stream` now feeds the terminal `SendReset` to the lifecycle
+                    // itself.
+                    self.queue_rst_stream(stream_id, code);
+                    self.complete_and_remove_stream(
+                        stream_id,
+                        Err(io::Error::other(format!(
+                            "stream reset requested: {code:?}"
+                        ))),
+                    );
+                    return DrainOutcome::Done;
+                }
+            }
+        };
+
+        if let Some(entry) = self.streams.get_mut(&stream_id) {
+            entry.send = Some(cursor);
+        }
+        outcome
+    }
+
+    /// The effective RFC 9218 priority for a stream's response: the latest `PRIORITY_UPDATE` if
+    /// one has been received, otherwise the request's own `priority` header (captured on the
+    /// [`StreamEntry`][super::StreamEntry] at open), otherwise the default. A stream no longer in
+    /// the map reads as the default.
+    pub(super) fn effective_priority(&self, stream_id: u32) -> crate::Priority {
+        self.stream_priorities
+            .get(&stream_id)
+            .copied()
+            .or_else(|| self.streams.get(&stream_id).map(|e| e.priority))
+            .unwrap_or_default()
+    }
+
+    /// `true` if the stream's send half is closed (or the stream is gone).
+    fn lifecycle_send_closed(&self, stream_id: u32) -> bool {
+        self.streams
+            .get(&stream_id)
+            .is_none_or(|e| e.shared.lifecycle_lock().send_closed())
+    }
+
+    /// Feed a send-side event to the stream's lifecycle. Send transitions are driver-controlled and
+    /// always legal if the pump respects the machine; an illegal one is `debug_assert`ed and
+    /// absorbed inside `on_event`, so the result is intentionally ignored.
+    fn feed_send(&self, stream_id: u32, event: StreamEvent) {
+        if let Some(entry) = self.streams.get(&stream_id) {
+            let _ = entry.shared.apply_event(event);
+        }
+    }
+
+    /// Poll the in-progress body for one DATA chunk, bounded by per-stream and connection send
+    /// windows. `Ready(Ok(true))` means the body drained (cursor advanced to the next part, any
+    /// body trailers spliced in as the terminator); `Ready(Ok(false))` means a DATA frame was
+    /// emitted; `Pending` means no bytes or no window right now.
+    fn poll_emit_body(
+        &mut self,
+        stream_id: u32,
+        cursor: &mut SendCursor,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<bool>> {
+        // Fast path: declared length reached — transition without another poll. Lets us close out
+        // a stream whose window just barely sufficed without waiting on a superfluous
+        // WINDOW_UPDATE.
+        if cursor.body_declared_len == Some(cursor.body_emitted) {
+            cursor.drain_body_into_trailers()?;
+            return Poll::Ready(Ok(true));
+        }
+
+        let stream_window = self.streams.get(&stream_id).map_or(0, |e| e.send_window);
+        let budget = stream_window.min(self.connection_send_window);
+        if budget <= 0 {
+            return Poll::Pending; // peer WINDOW_UPDATE on the read path will wake us
+        }
+        let cap = usize::try_from(budget)
+            .unwrap_or(usize::MAX)
+            .min(self.body_scratch.len());
+
+        // Single-copy framing: read the body straight into the tail of `write_buf` behind a
+        // reserved DATA-header prefix, then backfill the header. `write_buf` is
+        // driver-exclusive, so this needs no lock and no `unsafe`. The zero-init that
+        // `resize` performs is what makes the `poll_read` slice safe to hand out; it costs
+        // one memset in place of the eliminated scratch→`write_buf` memcpy. (The streaming
+        // ring in `poll_emit_ring` keeps `body_scratch` — its bytes come from another task.)
+        //
+        // Every early return below must `truncate(header_pos)` to undo this reservation —
+        // otherwise the zero-filled tail leaks onto the wire as a malformed DATA payload.
+        let prefix_len = frame::data::encoded_prefix_len(0);
+        let header_pos = self.write_buf.len();
+        let payload_start = header_pos + prefix_len;
+        self.write_buf.resize(payload_start + cap, 0);
+
+        let body = cursor.body.as_mut().expect("caller checked body.is_some()");
+        let n = match Pin::new(body).poll_read(cx, &mut self.write_buf[payload_start..]) {
+            Poll::Ready(Ok(n)) => n,
+            Poll::Ready(Err(e)) => {
+                self.write_buf.truncate(header_pos);
+                return Poll::Ready(Err(e));
+            }
+            Poll::Pending => {
+                self.write_buf.truncate(header_pos);
+                return Poll::Pending;
+            }
+        };
+        if n == 0 {
+            self.write_buf.truncate(header_pos);
+            // Short of the declared length (reaching it returns before reading): the body was
+            // truncated, and ending the stream cleanly would present it as complete.
+            if let Some(declared) = cursor.body_declared_len {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "h2 body ended after {} of {declared} declared bytes",
+                        cursor.body_emitted
+                    ),
+                )));
+            }
+            cursor.drain_body_into_trailers()?;
+            return Poll::Ready(Ok(true));
+        }
+
+        let n_u32 = u32::try_from(n).expect("read n <= body_scratch.len() fits u32");
+        log::trace!("h2 emit: DATA stream={stream_id} len={n} end_stream=false");
+        // Backfill the 9-byte DATA header in front of the payload, then drop the unused
+        // tail of the reservation (a short read gives `n < cap`).
+        frame::data::encode_prefix(
+            stream_id,
+            // Never END_STREAM here; trailers / empty-DATA carries END_STREAM.
+            false,
+            n_u32,
+            0,
+            &mut self.write_buf[header_pos..payload_start],
+        )
+        .expect("prefix slice sized from encoded_prefix_len");
+        self.write_buf.truncate(payload_start + n);
+        self.write_flush_pending = true;
+
+        let charge = i64::try_from(n).expect("n <= body_scratch.len() fits i64");
+        self.connection_send_window -= charge;
+        if let Some(entry) = self.streams.get_mut(&stream_id) {
+            entry.send_window -= charge;
+        }
+        cursor.body_emitted += n as u64;
+
+        // If the declared length is now satisfied, transition within this call so the loop frames
+        // the terminator instead of parking for a WINDOW_UPDATE that won't come.
+        if cursor.body_declared_len == Some(cursor.body_emitted) {
+            cursor.drain_body_into_trailers()?;
+            return Poll::Ready(Ok(true));
+        }
+        Poll::Ready(Ok(false))
+    }
+
+    /// Drain one DATA frame's worth of bytes from the streaming `outbound` ring, bounded by the
+    /// send windows. `Ready(true)` means the ring is empty; `Ready(false)` means a frame was
+    /// emitted; `Pending` means bytes remain but no window.
+    fn poll_emit_ring(&mut self, stream_id: u32) -> Poll<bool> {
+        let Some(shared) = self.streams.get(&stream_id).map(|e| Arc::clone(&e.shared)) else {
+            return Poll::Ready(true);
+        };
+        let ring_len = shared
+            .send
+            .outbound
+            .lock()
+            .expect("outbound mutex poisoned")
+            .len();
+        if ring_len == 0 {
+            return Poll::Ready(true);
+        }
+
+        let stream_window = self.streams.get(&stream_id).map_or(0, |e| e.send_window);
+        let budget = stream_window.min(self.connection_send_window);
+        if budget <= 0 {
+            return Poll::Pending;
+        }
+        let cap = usize::try_from(budget)
+            .unwrap_or(usize::MAX)
+            .min(self.body_scratch.len())
+            .min(ring_len);
+
+        {
+            let mut ring = shared
+                .send
+                .outbound
+                .lock()
+                .expect("outbound mutex poisoned");
+            self.body_scratch[..cap].copy_from_slice(&ring[..cap]);
+            ring.ignore_front(cap);
+        }
+        // Drained bytes freed ring capacity — wake any writer parked on backpressure.
+        shared.send.outbound_write_waker.wake();
+
+        let cap_u32 = u32::try_from(cap).expect("cap <= body_scratch.len() fits u32");
+        log::trace!("h2 emit: DATA stream={stream_id} len={cap} end_stream=false (ring)");
+        self.queue_frame(frame::data::encoded_prefix_len(0), |buf| {
+            frame::data::encode_prefix(stream_id, false, cap_u32, 0, buf)
+        });
+        self.write_buf.extend_from_slice(&self.body_scratch[..cap]);
+
+        let charge = i64::try_from(cap).expect("cap fits i64");
+        self.connection_send_window -= charge;
+        if let Some(entry) = self.streams.get_mut(&stream_id) {
+            entry.send_window -= charge;
+        }
+        Poll::Ready(false)
+    }
+
+    /// Emit a HEADERS block (initial response/request or trailers) as HEADERS + CONTINUATION
+    /// fragments up to `END_HEADERS`, encoding against the connection HPACK encoder at frame time
+    /// so the wire order matches the dynamic-table mutation order. `end_stream` is set on the first
+    /// fragment.
+    fn emit_headers_block(
+        &mut self,
+        stream_id: u32,
+        field_section: &FieldSection<'_>,
+        end_stream: bool,
+    ) {
+        // Reuse the retained scratch (take/restore so the chunking loop below can still borrow
+        // `self` for queue_frame / write_buf). After the first response grows it, the encode is
+        // allocation-free.
+        let mut encoded = std::mem::take(&mut self.headers_scratch);
+        encoded.clear();
+        self.hpack_encoder.encode(field_section, &mut encoded);
+        let max_payload = self
+            .connection
+            .current_peer_settings()
+            .effective_max_frame_size() as usize;
+
+        let mut offset = 0;
+        let mut first = true;
+        loop {
+            let remaining = encoded.len() - offset;
+            let chunk = remaining.min(max_payload);
+            let end_headers = chunk == remaining;
+            let chunk_u32 = u32::try_from(chunk).expect("chunk <= max_frame_size fits u32");
+            if first {
+                log::trace!(
+                    "h2 emit: HEADERS stream={stream_id} len={chunk} end_headers={end_headers} \
+                     end_stream={end_stream}",
+                );
+                self.queue_frame(frame::headers::encoded_prefix_len(0, false), |buf| {
+                    frame::headers::encode_prefix(
+                        stream_id,
+                        end_stream,
+                        end_headers,
+                        None,
+                        chunk_u32,
+                        0,
+                        buf,
+                    )
+                });
+            } else {
+                log::trace!(
+                    "h2 emit: CONTINUATION stream={stream_id} len={chunk} \
+                     end_headers={end_headers}",
+                );
+                self.queue_frame(frame::continuation::ENCODED_PREFIX_LEN, |buf| {
+                    frame::continuation::encode_prefix(stream_id, end_headers, chunk_u32, buf)
+                });
+            }
+            self.write_buf
+                .extend_from_slice(&encoded[offset..offset + chunk]);
+            offset += chunk;
+            first = false;
+            if end_headers {
+                break;
+            }
+        }
+
+        // Restore the (now grown) buffer for the next header block to reuse.
+        self.headers_scratch = encoded;
+    }
+
+    /// Emit an empty `DATA(END_STREAM)` frame as the stream terminator.
+    fn emit_empty_end_stream(&mut self, stream_id: u32) {
+        log::trace!("h2 emit: DATA stream={stream_id} len=0 end_stream=true (terminator)");
+        self.queue_frame(frame::data::encoded_prefix_len(0), |buf| {
+            frame::data::encode_prefix(stream_id, true, 0, 0, buf)
+        });
+    }
+
+    /// Send pump's success-path completion: the terminator has been framed and the lifecycle
+    /// transitioned (the terminator's event was fed before this call). Resolves the conn task's
+    /// `SubmitSend`, then — if the stream is now fully `Closed` — tears it down: the server
+    /// removes it; the client keeps the entry in the map for post-EOF trailer access and
+    /// removes it on transport drop. If the recv half is still open (`HalfClosedLocal`) the
+    /// stream lingers until the peer's `END_STREAM` lands via [`route_data`][super::recv].
+    pub(super) fn finalize_send(&mut self, stream_id: u32) {
+        self.resolve_submit_send(stream_id, Ok(()));
+        self.close_if_both_done(stream_id);
+    }
+
+    /// Close and tear down the stream if both halves are done (`lifecycle.is_closed()`). Server
+    /// removes the entry; client keeps it (for trailer access) and signals close. No-op
+    /// otherwise. Called from both the send terminator path and the recv `END_STREAM` path.
+    pub(super) fn close_if_both_done(&mut self, stream_id: u32) {
+        let closed = self
+            .streams
+            .get(&stream_id)
+            .is_some_and(|e| e.shared.lifecycle_lock().is_closed());
+        if !closed {
+            return;
+        }
+        match self.role {
+            Role::Server => self.complete_and_remove_stream(stream_id, Ok(())),
+            Role::Client => self.signal_close(stream_id, Ok(())),
+        }
+    }
+
+    /// Signal send completion + record the close reason, but keep the stream in both maps. Used by
+    /// client-role clean completion (the application's [`H2Transport`] keeps a working handle for
+    /// trailer access; removal happens on transport drop) and as the inner half of
+    /// [`Self::complete_and_remove_stream`].
+    pub(super) fn signal_close(&mut self, stream_id: u32, result: io::Result<()>) {
+        log::trace!("h2 stream {stream_id}: completing send ({result:?})");
+        let reason = if result.is_err() {
+            ClosedReason::Reset
+        } else {
+            ClosedReason::EndStream
+        };
+        self.closed_streams.record_close(stream_id, reason);
+        if let Some(entry) = self.streams.get(&stream_id) {
+            resolve_submit_send(&entry.shared, result);
+            // Wake every conn-task-side waiter so a handler parked on this stream observes the
+            // teardown instead of hanging (and leaking its swansong guard). A stream the driver
+            // tears down on its own — stream-level RST, flow-control overflow, malformed trailers —
+            // strands a handler parked reading the request body (`recv.waker`) or writing a bidi
+            // response (`outbound_write_waker`) unless we wake them here; the FSM is already
+            // recv/send-closed, so they re-poll to EOF / `BrokenPipe`. `response_headers_waker` is
+            // the client-role analog (no-op on server streams).
+            entry.shared.recv.waker.wake();
+            entry.shared.recv.response_headers_waker.wake();
+            entry.shared.send.outbound_write_waker.wake();
+        }
+    }
+
+    /// Resolve the conn task's `SubmitSend` future (idempotent) without touching the maps.
+    fn resolve_submit_send(&self, stream_id: u32, result: io::Result<()>) {
+        if let Some(entry) = self.streams.get(&stream_id) {
+            resolve_submit_send(&entry.shared, result);
+        }
+    }
+
+    /// Signal completion, then remove the stream from the driver's private map and the connection's
+    /// shared map. Used by error / reset paths and server-role clean completion.
+    ///
+    /// A stream still open on the wire (its body failed mid-send) is reset first: without a
+    /// terminal frame, the peer would wait on it indefinitely. The reset has to precede
+    /// `signal_close`'s wakes, so a woken task re-checks against the closed lifecycle rather than
+    /// parking again on a stream that's about to vanish.
+    pub(super) fn complete_and_remove_stream(&mut self, stream_id: u32, result: io::Result<()>) {
+        if self
+            .streams
+            .get(&stream_id)
+            .is_some_and(|entry| !entry.shared.lifecycle_lock().is_closed())
+        {
+            log::debug!("h2 stream {stream_id}: removed while open; RST_STREAM(INTERNAL_ERROR)");
+            self.queue_rst_stream(stream_id, H2ErrorCode::InternalError);
+        }
+        self.signal_close(stream_id, result);
+        self.remove_from_stream_maps(stream_id);
+    }
+
+    /// Drop the entry from the driver's private map and the connection's shared map, and release
+    /// any tracked `PRIORITY_UPDATE` for the stream. Pruning the priority here is safe because
+    /// peer stream ids are monotonic — a closed stream's id can never reopen — and it keeps the
+    /// bounded `stream_priorities` table from filling with dead closed-stream entries (which would
+    /// then silently drop later updates at capacity). A `PRIORITY_UPDATE` for a not-yet-opened
+    /// stream is retained: this only fires once a stream has been in the maps. The stream's unread
+    /// receive window goes back to the connection. Only closed streams come through here; open ones
+    /// go through [`Self::complete_and_remove_stream`], which resets them.
+    pub(super) fn remove_from_stream_maps(&mut self, stream_id: u32) {
+        debug_assert!(
+            self.streams
+                .get(&stream_id)
+                .is_none_or(|entry| entry.shared.lifecycle_lock().is_closed()),
+            "h2 stream {stream_id} removed while open"
+        );
+        if let Some(entry) = self.streams.remove(&stream_id) {
+            self.release_stream_recv_window(&entry.shared);
+        }
+        self.connection.streams_lock().remove(&stream_id);
+        self.stream_priorities.remove(&stream_id);
+    }
+}
+
+/// Resolve the conn task's [`SubmitSend`][super::super::SubmitSend]: store the result, flip
+/// `submit_resolved`, wake its waker. Idempotent — a no-op once already resolved (the upgrade path
+/// resolves early at the prelude handoff, so the eventual terminator must not clobber the result).
+fn resolve_submit_send(state: &StreamState, result: io::Result<()>) {
+    if state.send.submit_resolved.load(Ordering::Acquire) {
+        return;
+    }
+    *state
+        .send
+        .completion_result
+        .lock()
+        .expect("completion_result mutex poisoned") = Some(result);
+    state.send.submit_resolved.store(true, Ordering::Release);
+    state.send.completion_waker.wake();
+}

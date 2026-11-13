@@ -1,0 +1,649 @@
+use crate::{CapturesNewType, RouteSpecNewType, RouterRef};
+use routefinder::{Match, RouteSpec, Router as Routefinder};
+use std::{
+    borrow::Cow,
+    collections::BTreeSet,
+    fmt::{self, Debug, Display, Formatter},
+    mem,
+};
+use trillium::{BoxedHandler, Conn, Handler, Info, KnownHeaderName, Method, Upgrade};
+
+const ALL_METHODS: [Method; 5] = [
+    Method::Delete,
+    Method::Get,
+    Method::Patch,
+    Method::Post,
+    Method::Put,
+];
+
+#[derive(Debug)]
+enum MethodSelection {
+    Just(Method),
+    All,
+    Any(Vec<Method>),
+}
+
+impl Display for MethodSelection {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            MethodSelection::Just(m) => Display::fmt(m, f),
+            MethodSelection::All => f.write_str("*"),
+            MethodSelection::Any(v) => {
+                f.write_str(&v.iter().map(|m| m.as_ref()).collect::<Vec<_>>().join(", "))
+            }
+        }
+    }
+}
+
+impl PartialEq<Method> for MethodSelection {
+    fn eq(&self, other: &Method) -> bool {
+        match self {
+            MethodSelection::Just(m) => m == other,
+            MethodSelection::All => true,
+            MethodSelection::Any(v) => v.contains(other),
+        }
+    }
+}
+
+impl From<()> for MethodSelection {
+    fn from(_: ()) -> MethodSelection {
+        Self::All
+    }
+}
+
+impl From<Method> for MethodSelection {
+    fn from(method: Method) -> Self {
+        Self::Just(method)
+    }
+}
+
+impl From<&[Method]> for MethodSelection {
+    fn from(methods: &[Method]) -> Self {
+        Self::Any(methods.to_vec())
+    }
+}
+impl From<Vec<Method>> for MethodSelection {
+    fn from(methods: Vec<Method>) -> Self {
+        Self::Any(methods)
+    }
+}
+
+#[derive(Debug, Default)]
+struct MethodRoutefinder(Routefinder<(MethodSelection, BoxedHandler)>);
+impl MethodRoutefinder {
+    fn add<R>(
+        &mut self,
+        method_selection: impl Into<MethodSelection>,
+        path: R,
+        handler: impl Handler,
+    ) where
+        R: TryInto<RouteSpec>,
+        R::Error: Debug,
+    {
+        self.0
+            .add(path, (method_selection.into(), BoxedHandler::new(handler)))
+            .expect("could not add route")
+    }
+
+    fn methods_matching(&self, path: &str) -> BTreeSet<Method> {
+        let mut set = BTreeSet::new();
+
+        fn extend(ms: &MethodSelection, set: &mut BTreeSet<Method>) {
+            match ms {
+                MethodSelection::All => {
+                    set.extend(ALL_METHODS);
+                }
+                MethodSelection::Just(method) => {
+                    set.insert(*method);
+                }
+                MethodSelection::Any(methods) => {
+                    set.extend(methods);
+                }
+            }
+        }
+
+        if path == "*" {
+            for ms in self.0.iter().map(|(_, (m, _))| m) {
+                extend(ms, &mut set);
+            }
+        } else {
+            for m in self.0.match_iter(path) {
+                extend(&m.0, &mut set);
+            }
+        };
+
+        set.remove(&Method::Options);
+        set
+    }
+
+    fn best_match<'a, 'b>(
+        &'a self,
+        method: Method,
+        path: &'b str,
+    ) -> Option<Match<'a, 'b, (MethodSelection, BoxedHandler)>> {
+        self.0.match_iter(path).find(|m| m.0 == method)
+    }
+}
+
+/// # The Router handler
+///
+/// See crate level docs for more, as this is the primary type in this crate.
+pub struct Router {
+    routefinder: MethodRoutefinder,
+    handle_options: bool,
+    handle_method_not_allowed: bool,
+}
+
+impl Default for Router {
+    fn default() -> Self {
+        Self {
+            routefinder: MethodRoutefinder::default(),
+            handle_options: true,
+            handle_method_not_allowed: false,
+        }
+    }
+}
+
+macro_rules! method {
+    ($fn_name:ident, $method:ident) => {
+        method!(
+            $fn_name,
+            $method,
+            concat!(
+                // yep, macro-generated doctests
+                "Registers a handler for the ",
+                stringify!($fn_name),
+                " http method.
+
+```
+# use trillium::Conn;
+# use trillium_router::Router;
+# use trillium_testing::TestServer;
+# trillium_testing::block_on(async {
+let router = Router::new().",
+                stringify!($fn_name),
+                "(\"/some/route\", |conn: Conn| async move {
+  conn.ok(\"success\")
+});
+
+let app = TestServer::new(router).await;
+app.",
+                stringify!($fn_name),
+                "(\"/some/route\").await
+    .assert_ok()
+    .assert_body(\"success\");
+app.",
+                stringify!($fn_name),
+                "(\"/other/route\").await
+    .assert_status(404);
+# });
+```
+"
+            )
+        );
+    };
+
+    ($fn_name:ident, $method:ident, $doc_comment:expr_2021) => {
+        #[doc = $doc_comment]
+        pub fn $fn_name<R>(mut self, path: R, handler: impl Handler) -> Self
+        where
+            R: TryInto<RouteSpec>,
+            R::Error: Debug,
+        {
+            self.add(path, Method::$method, handler);
+            self
+        }
+    };
+}
+
+impl Router {
+    method!(get, Get);
+
+    method!(post, Post);
+
+    method!(put, Put);
+
+    method!(delete, Delete);
+
+    method!(patch, Patch);
+
+    /// Constructs a new Router. This is often used with [`Router::get`],
+    /// [`Router::post`], [`Router::put`], [`Router::delete`], and
+    /// [`Router::patch`] chainable methods to build up an application.
+    ///
+    /// For an alternative way of constructing a Router, see [`Router::build`]
+    ///
+    /// ```
+    /// # use trillium::Conn;
+    /// # use trillium_router::Router;
+    /// # use trillium_testing::TestServer;
+    ///
+    /// # trillium_testing::block_on(async {
+    /// let router = Router::new()
+    ///     .get("/", |conn: Conn| async move {
+    ///         conn.ok("you have reached the index")
+    ///     })
+    ///     .get("/some/:param", |conn: Conn| async move {
+    ///         conn.ok("you have reached /some/:param")
+    ///     })
+    ///     .post("/", |conn: Conn| async move { conn.ok("post!") });
+    ///
+    /// let app = TestServer::new(router).await;
+    /// app.get("/")
+    ///     .await
+    ///     .assert_ok()
+    ///     .assert_body("you have reached the index");
+    /// app.get("/some/route")
+    ///     .await
+    ///     .assert_ok()
+    ///     .assert_body("you have reached /some/:param");
+    /// app.post("/").await.assert_ok().assert_body("post!");
+    /// # });
+    /// ```
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Disable the default behavior of responding to OPTIONS requests
+    /// with the supported methods at a given path
+    pub fn without_options_handling(mut self) -> Self {
+        self.set_options_handling(false);
+        self
+    }
+
+    /// enable or disable the router's behavior of responding to OPTIONS requests with the supported
+    /// methods at given path.
+    ///
+    /// default: enabled
+    pub(crate) fn set_options_handling(&mut self, options_enabled: bool) -> &mut Self {
+        self.handle_options = options_enabled;
+        self
+    }
+
+    /// Enable responding to a request whose path matches a route but whose method does not with
+    /// `405 Method Not Allowed` and an `Allow` header listing the methods that path does support.
+    ///
+    /// The status is set *without halting the conn*, so a subsequent handler is free to replace it;
+    /// the `405` only stands if nothing else handles the request. Without this enabled (the
+    /// default), a method mismatch falls through unchanged, which typically results in a `404`.
+    ///
+    /// This is opt-in because enabling it changes the response to requests that previously fell
+    /// through the router, and because advertising the supported methods reveals that the path
+    /// exists.
+    pub fn with_method_not_allowed(mut self) -> Self {
+        self.set_method_not_allowed(true);
+        self
+    }
+
+    /// enable or disable the router's behavior of responding to a method mismatch on a known path
+    /// with `405 Method Not Allowed` plus an `Allow` header.
+    ///
+    /// default: disabled
+    pub(crate) fn set_method_not_allowed(&mut self, enabled: bool) -> &mut Self {
+        self.handle_method_not_allowed = enabled;
+        self
+    }
+
+    /// Another way to build a router, if you don't like the chainable
+    /// interface described in [`Router::new`]. Note that the argument to
+    /// the closure is a [`RouterRef`].
+    ///
+    /// ```
+    /// # use trillium::Conn;
+    /// # use trillium_router::Router;
+    /// # use trillium_testing::TestServer;
+    /// # trillium_testing::block_on(async {
+    /// let router = Router::build(|mut router| {
+    ///     router.get("/", |conn: Conn| async move {
+    ///         conn.ok("you have reached the index")
+    ///     });
+    ///
+    ///     router.get("/some/:paramroute", |conn: Conn| async move {
+    ///         conn.ok("you have reached /some/:param")
+    ///     });
+    ///
+    ///     router.post("/", |conn: Conn| async move { conn.ok("post!") });
+    /// });
+    ///
+    /// let app = TestServer::new(router).await;
+    /// app.get("/")
+    ///     .await
+    ///     .assert_ok()
+    ///     .assert_body("you have reached the index");
+    /// app.get("/some/route")
+    ///     .await
+    ///     .assert_ok()
+    ///     .assert_body("you have reached /some/:param");
+    /// app.post("/").await.assert_ok().assert_body("post!");
+    /// # });
+    /// ```
+    pub fn build(builder: impl Fn(RouterRef)) -> Router {
+        let mut router = Router::new();
+        builder(RouterRef::new(&mut router));
+        router
+    }
+
+    fn best_match<'a, 'b>(
+        &'a self,
+        method: Method,
+        path: &'b str,
+    ) -> Option<Match<'a, 'b, (MethodSelection, BoxedHandler)>> {
+        self.routefinder.best_match(method, path)
+    }
+
+    /// Registers a handler for a method other than get, put, post, patch, or delete.
+    ///
+    /// ```
+    /// # use trillium::{Conn, Method};
+    /// # use trillium_router::Router;
+    /// # use trillium_testing::TestServer;
+    /// # trillium_testing::block_on(async {
+    /// let router = Router::new()
+    ///     .with_route("OPTIONS", "/some/route", |conn: Conn| async move {
+    ///         conn.ok("directly handling options")
+    ///     })
+    ///     .with_route(Method::Checkin, "/some/route", |conn: Conn| async move {
+    ///         conn.ok("checkin??")
+    ///     });
+    ///
+    /// let app = TestServer::new(router).await;
+    /// app.build(Method::Options, "/some/route")
+    ///     .await
+    ///     .assert_ok()
+    ///     .assert_body("directly handling options");
+    /// app.build(Method::Checkin, "/some/route")
+    ///     .await
+    ///     .assert_ok()
+    ///     .assert_body("checkin??");
+    /// # });
+    /// ```
+    pub fn with_route<M, R>(mut self, method: M, path: R, handler: impl Handler) -> Self
+    where
+        M: TryInto<Method>,
+        <M as TryInto<Method>>::Error: Debug,
+        R: TryInto<RouteSpec>,
+        R::Error: Debug,
+    {
+        self.add(path, method.try_into().unwrap(), handler);
+        self
+    }
+
+    pub(crate) fn add<R>(&mut self, path: R, method: Method, handler: impl Handler)
+    where
+        R: TryInto<RouteSpec>,
+        R::Error: Debug,
+    {
+        self.routefinder.add(method, path, handler);
+    }
+
+    pub(crate) fn add_any<R>(&mut self, methods: &[Method], path: R, handler: impl Handler)
+    where
+        R: TryInto<RouteSpec>,
+        R::Error: Debug,
+    {
+        self.routefinder.add(methods, path, handler)
+    }
+
+    pub(crate) fn add_all<R>(&mut self, path: R, handler: impl Handler)
+    where
+        R: TryInto<RouteSpec>,
+        R::Error: Debug,
+    {
+        self.routefinder.add((), path, handler);
+    }
+
+    /// Appends the handler to all (get, post, put, delete, and patch) methods.
+    /// ```
+    /// # use trillium::Conn;
+    /// # use trillium_router::Router;
+    /// # use trillium_testing::TestServer;
+    /// let router = Router::new().all("/any", |conn: Conn| async move {
+    ///     let response = format!("you made a {} request to /any", conn.method());
+    ///     conn.ok(response)
+    /// });
+    ///
+    /// # trillium_testing::block_on(async {
+    /// let app = TestServer::new(router).await;
+    ///
+    /// app.get("/any")
+    ///     .await
+    ///     .assert_ok()
+    ///     .assert_body("you made a GET request to /any");
+    ///
+    /// app.post("/any")
+    ///     .await
+    ///     .assert_ok()
+    ///     .assert_body("you made a POST request to /any");
+    ///
+    /// app.delete("/any")
+    ///     .await
+    ///     .assert_ok()
+    ///     .assert_body("you made a DELETE request to /any");
+    ///
+    /// app.patch("/any")
+    ///     .await
+    ///     .assert_ok()
+    ///     .assert_body("you made a PATCH request to /any");
+    ///
+    /// app.put("/any")
+    ///     .await
+    ///     .assert_ok()
+    ///     .assert_body("you made a PUT request to /any");
+    ///
+    /// app.get("/").await.assert_status(404);
+    /// # });
+    /// ```
+    pub fn all<R>(mut self, path: R, handler: impl Handler) -> Self
+    where
+        R: TryInto<RouteSpec>,
+        R::Error: Debug,
+    {
+        self.add_all(path, handler);
+        self
+    }
+
+    /// Appends the handler to each of the provided http methods.
+    /// ```
+    /// # use trillium::Conn;
+    /// # use trillium_router::Router;
+    /// # use trillium_testing::TestServer;
+    /// let router = Router::new().any(&["get", "post"], "/get_or_post", |conn: Conn| async move {
+    ///     let response = format!("you made a {} request to /get_or_post", conn.method());
+    ///     conn.ok(response)
+    /// });
+    ///
+    /// # trillium_testing::block_on(async {
+    /// let app = TestServer::new(router).await;
+    ///
+    /// app.get("/get_or_post")
+    ///     .await
+    ///     .assert_ok()
+    ///     .assert_body("you made a GET request to /get_or_post");
+    ///
+    /// app.post("/get_or_post")
+    ///     .await
+    ///     .assert_ok()
+    ///     .assert_body("you made a POST request to /get_or_post");
+    ///
+    /// app.delete("/any").await.assert_status(404);
+    /// app.patch("/any").await.assert_status(404);
+    /// app.put("/any").await.assert_status(404);
+    /// app.get("/").await.assert_status(404);
+    /// # });
+    /// ```
+    pub fn any<IntoMethod, R>(
+        mut self,
+        methods: &[IntoMethod],
+        path: R,
+        handler: impl Handler,
+    ) -> Self
+    where
+        IntoMethod: TryInto<Method> + Clone,
+        <IntoMethod as TryInto<Method>>::Error: Debug,
+        R: TryInto<RouteSpec>,
+        R::Error: Debug,
+    {
+        let methods = methods
+            .iter()
+            .cloned()
+            .map(|m| m.try_into().unwrap())
+            .collect::<Vec<_>>();
+        self.add_any(&methods, path, handler);
+        self
+    }
+}
+
+impl Handler for Router {
+    async fn run(&self, mut conn: Conn) -> Conn {
+        let method = conn.method();
+        let original_captures = conn.take_state();
+        let path = conn.path();
+        let mut has_path = false;
+
+        if let Some(m) = self.best_match(conn.method(), path) {
+            let mut captures = m.captures().into_owned();
+
+            let route = m.route().clone();
+
+            if let Some(CapturesNewType(mut original_captures)) = original_captures {
+                original_captures.append(captures);
+                captures = original_captures;
+            }
+
+            log::debug!("running {}: {}", m.route(), m.1.name());
+            let mut new_conn = m
+                .handler()
+                .1
+                .run({
+                    if let Some(wildcard) = captures.wildcard() {
+                        conn.push_path(String::from(wildcard));
+                        has_path = true;
+                    }
+
+                    conn.with_state(CapturesNewType(captures))
+                        .with_state(RouteSpecNewType(route))
+                })
+                .await;
+
+            if has_path {
+                new_conn.pop_path();
+            }
+            new_conn
+        } else if method == Method::Options && self.handle_options {
+            let allow = self
+                .routefinder
+                .methods_matching(path)
+                .iter()
+                .map(|m| m.as_ref())
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            conn.with_response_header(KnownHeaderName::Allow, allow)
+                .with_status(204)
+                .halt()
+        } else if let Some(allow) = self
+            .handle_method_not_allowed
+            .then(|| self.routefinder.methods_matching(path))
+            .filter(|methods| !methods.is_empty())
+            .map(|methods| {
+                methods
+                    .iter()
+                    .map(|m| m.as_ref())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+        {
+            // Soft default: set the status without halting, so a later handler can replace the
+            // 405. If nothing does, it stands as the fall-through response.
+            conn.with_response_header(KnownHeaderName::Allow, allow)
+                .with_status(405)
+        } else {
+            log::debug!("{} did not match any route", conn.path());
+            conn
+        }
+    }
+
+    async fn before_send(&self, mut conn: Conn) -> Conn {
+        let Some((handler, wildcard)) = self
+            .best_match(conn.method(), conn.path())
+            .map(|m| (&m.handler().1, m.captures().wildcard().map(String::from)))
+        else {
+            return conn;
+        };
+
+        // Mirror `run`'s path push so a nested router's `before_send` re-matches against the
+        // same path form its routes are registered in.
+        if let Some(wildcard) = wildcard {
+            conn.push_path(wildcard);
+            let mut conn = handler.before_send(conn).await;
+            conn.pop_path();
+            conn
+        } else {
+            handler.before_send(conn).await
+        }
+    }
+
+    fn has_upgrade(&self, upgrade: &Upgrade) -> bool {
+        let Some(m) = self.best_match(upgrade.method(), upgrade.path()) else {
+            return false;
+        };
+
+        match m.captures().wildcard() {
+            Some(wildcard) => {
+                upgrade.push_path(String::from(wildcard));
+                let has_upgrade = m.1.has_upgrade(upgrade);
+                upgrade.pop_path();
+                has_upgrade
+            }
+            None => m.1.has_upgrade(upgrade),
+        }
+    }
+
+    async fn upgrade(&self, upgrade: Upgrade) {
+        let (handler, wildcard) = {
+            let m = self
+                .best_match(upgrade.method(), upgrade.path())
+                .expect("upgrade called without has_upgrade");
+            (&m.handler().1, m.captures().wildcard().map(String::from))
+        };
+
+        if let Some(wildcard) = wildcard {
+            upgrade.push_path(wildcard);
+        }
+
+        handler.upgrade(upgrade).await
+    }
+
+    fn name(&self) -> Cow<'static, str> {
+        "Router".into()
+    }
+
+    async fn init(&mut self, info: &mut Info) {
+        // This code is not what a reader would expect, so here's a
+        // brief explanation:
+        //
+        // Mutable map iterators are not Send, and because we need to hold that data across await
+        // boundaries in a Send future, we cannot mutate in place.
+        //
+        // However, because this is only called once at app boot, and because we have &mut self, it
+        // is safe to move the router contents into this future and then replace it, and the
+        // performance impacts of doing so are unimportant as it is part of app boot.
+        let routefinder = mem::take(&mut self.routefinder);
+        for (route, (methods, mut handler)) in routefinder.0 {
+            handler.init(info).await;
+            self.routefinder.add(methods, route, handler);
+        }
+    }
+}
+
+impl Debug for Router {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("Router ")?;
+        let mut set = f.debug_set();
+
+        for (route, (methods, handler)) in &self.routefinder.0 {
+            set.entry(&format_args!("{} {} -> {}", methods, route, handler.name()));
+        }
+        set.finish()
+    }
+}

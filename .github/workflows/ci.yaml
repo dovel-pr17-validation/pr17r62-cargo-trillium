@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches:
+      - main
+
+# env:
+#   RUSTFLAGS: -Dwarnings
+
+jobs:
+  test:
+    name: ${{ matrix.name }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Runtimeless is the default transport the bulk of the suite runs
+          # under during development; it's exercised on every OS.
+          - { name: runtimeless, os: ubuntu-latest,  cmd: "cargo nextest run --workspace", rustflags: "" }
+          - { name: runtimeless, os: macOS-latest,   cmd: "cargo nextest run --workspace", rustflags: "" }
+          - { name: runtimeless, os: windows-latest, cmd: "cargo nextest run --workspace", rustflags: "" }
+
+          # Real-runtime slice: client <-> in-process server across protocols
+          # (h1/h2/h3), plus quinn (h3/QUIC over real UDP) and static (runtime
+          # selection feature). The smol workspace run lives in the coverage job.
+          - { name: tokio,     os: ubuntu-latest,  cmd: "cargo nextest run -p trillium-client -p trillium-quinn -p trillium-static --features trillium-testing/tokio,trillium-static/tokio", rustflags: "--cfg=quinn_testing" }
+          - { name: tokio,     os: macOS-latest,   cmd: "cargo nextest run -p trillium-client -p trillium-quinn -p trillium-static --features trillium-testing/tokio,trillium-static/tokio", rustflags: "--cfg=quinn_testing" }
+          - { name: tokio,     os: windows-latest, cmd: "cargo nextest run -p trillium-client -p trillium-quinn -p trillium-static --features trillium-testing/tokio,trillium-static/tokio", rustflags: "--cfg=quinn_testing" }
+          - { name: async-std, os: ubuntu-latest,  cmd: "cargo nextest run -p trillium-client -p trillium-quinn -p trillium-static --features trillium-testing/async-std,trillium-static/async-std", rustflags: "--cfg=quinn_testing" }
+          - { name: async-std, os: macOS-latest,   cmd: "cargo nextest run -p trillium-client -p trillium-quinn -p trillium-static --features trillium-testing/async-std,trillium-static/async-std", rustflags: "--cfg=quinn_testing" }
+          - { name: async-std, os: windows-latest, cmd: "cargo nextest run -p trillium-client -p trillium-quinn -p trillium-static --features trillium-testing/async-std,trillium-static/async-std", rustflags: "--cfg=quinn_testing" }
+    steps:
+      - uses: actions/checkout@master
+        with:
+          submodules: recursive
+      - name: Install mkcert (Linux)
+        run: curl -JLO "https://dl.filippo.io/mkcert/latest?for=linux/amd64" && chmod +x mkcert-v*-linux-amd64 && sudo cp mkcert-v*-linux-amd64 /usr/local/bin/mkcert && mkcert -install && mkcert localhost
+        if: matrix.os == 'ubuntu-latest'
+
+      - name: get-cmake
+        uses: lukka/get-cmake@v4.4.2
+
+      - name: Install NASM for aws-lc-rs on Windows
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
+      - name: Configure OpenSSL (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          echo "OPENSSL_DIR=C:\Program Files\OpenSSL" >> $env:GITHUB_ENV
+          echo "OPENSSL_LIB_DIR=C:\Program Files\OpenSSL\lib\VC\x64\MD" >> $env:GITHUB_ENV
+          echo "OPENSSL_INCLUDE_DIR=C:\Program Files\OpenSSL\include" >> $env:GITHUB_ENV
+
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2.9.3
+
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+
+      # WinNAT reserves per-protocol port ranges inside the ephemeral range,
+      # so a port obtained by binding TCP :0 can be UDP-excluded, failing the
+      # paired QUIC bind with WSAEACCES. Restarting the service clears the
+      # reservations; nothing in CI recreates them.
+      - name: Clear WinNAT port exclusions (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          net stop winnat
+          net start winnat
+
+      - name: Run tests
+        run: ${{ matrix.cmd }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+          NEXTEST_PROFILE: ci
+
+  doctests:
+    name: doctests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@master
+        with:
+          submodules: recursive
+      - name: Install mkcert
+        run: curl -JLO "https://dl.filippo.io/mkcert/latest?for=linux/amd64" && chmod +x mkcert-v*-linux-amd64 && sudo cp mkcert-v*-linux-amd64 /usr/local/bin/mkcert && mkcert -install && mkcert localhost
+      - name: get-cmake
+        uses: lukka/get-cmake@v4.4.2
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2.9.3
+      # Doctests run once, under the runtimeless default; nextest can't run them.
+      - name: Run doctests
+        run: cargo test --doc --workspace
+
+  check_fmt_and_docs:
+    name: Lints and Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@master
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2.9.3
+      - name: Format
+        run: cargo fmt --all -- --check
+      # - name: Run cargo-udeps
+      #   uses: aig787/cargo-udeps-action@v1
+      #   with:
+      #     version: latest
+      #     args: --all-targets
+      - uses: dtolnay/install@cargo-docs-rs
+      - name: Docs
+        run: |
+          cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.targets[].kind[] == "lib") | .name' \
+            | xargs -I{} cargo docs-rs -p {}
+        env:
+          RUSTDOCFLAGS: -D warnings

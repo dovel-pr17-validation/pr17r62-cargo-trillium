@@ -1,0 +1,33 @@
+//! Quinn-backed QUIC adapter for Trillium HTTP/3.
+//!
+//! This crate provides [`QuicConfig`], which enables HTTP/3 over QUIC using the
+//! [quinn](https://docs.rs/quinn) library alongside any Trillium server adapter.
+//!
+//! # Crypto provider
+//!
+//! TLS is required for HTTP/3. Select a crypto provider feature:
+//! - `aws-lc-rs` (default)
+//! - `ring` — use the ring crypto library instead
+//! - `custom-crypto-provider` — bring your own provider via
+//!   `rustls::crypto::CryptoProvider::install_default`
+//!
+//! # Client verifier
+//!
+//! The `platform-verifier` feature (enabled by default) makes [`ClientQuicConfig::default`]
+//! verify servers with [`rustls-platform-verifier`](https://docs.rs/rustls-platform-verifier).
+//! Without it, the default trusts the WebPKI roots compiled into the binary.
+
+#[cfg(test)]
+#[doc = include_str!("../README.md")]
+mod readme {}
+
+mod client;
+mod config;
+mod connection;
+mod crypto_provider;
+mod runtime;
+
+pub use client::ClientQuicConfig;
+pub use config::{QuicConfig, QuinnEndpoint};
+pub use connection::{QuinnConnection, QuinnRecv, QuinnSend, QuinnTransport};
+pub use quinn;

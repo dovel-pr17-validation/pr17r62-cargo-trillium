@@ -1,0 +1,35 @@
+[package]
+name = "trillium-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/trillium-rs/trillium"
+readme = "../README.md"
+keywords = ["trillium", "framework", "async"]
+categories = ["web-programming::http-server", "web-programming"]
+
+[dependencies]
+env_logger = "0.11.10"
+trillium.workspace = true
+trillium-router.workspace = true
+trillium-logger.workspace = true
+trillium-cookies.workspace = true
+trillium-sessions.workspace = true
+trillium-websockets.workspace = true
+trillium-smol.workspace = true
+trillium-askama.workspace = true
+futures-lite = "2.6.1"
+askama = "0.16"
+trillium-static-compiled.workspace = true
+trillium-proxy.workspace = true
+trillium-rustls.workspace = true
+log = "0.4.29"
+trillium-head.workspace = true
+trillium-method-override.workspace = true
+trillium-conn-id.workspace = true
+trillium-caching-headers.workspace = true
+trillium-compression.workspace = true
+
+[dev-dependencies]
+trillium-testing = { path = "../testing" }
